@@ -7,11 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.96] - 2026-10-14
+
+Window since v1.0.0-rc.95: dynamic `text` doc-values flush-parity fix, the
+published `#1062`/`#1108` `_watcher` detection-gate measurement, `quinn-proto`
+security update, Corpus Hub reachability in `llms.txt`, and community field
+reports. Contributors in this window: Tong-bit-art, Tyagiquamar, sebollin, and
+todie.
+
+### Fixed
+
+- **Inferred `text` fields take the ES dynamic-mapping `doc_values: false`
+  default** (PR [#1329](https://github.com/xerj-org/xerj/pull/1329),
+  Tong-bit-art) — `dynamic_field_config_at_depth` previously left `doc_values`
+  at `FieldOptions`'s `true` default on inferred `text` fields while declared
+  `text` fields defaulted to `false`. At flush, the segment wrote a whole-value
+  keyword column for the inferred `text` field and answered `terms` against raw
+  un-tokenized strings instead of analyzed tokens (another instance of the #423
+  "answers change at flush" class, plus unnecessary `.dv` disk footprint).
+  Inferred `text` fields now set `doc_values: false` to match declared `text`
+  fields and ES dynamic mapping while `.keyword` sub-fields keep their column.
+  PR [#1356](https://github.com/xerj-org/xerj/pull/1356) (Tong-bit-art) updates
+  the `graph_expand` test fixture to declare its §2.2 `edges` keyword mapping
+  explicitly after `#1329`.
+
+### Security
+
+- **Bump `quinn-proto` from `0.11.14` to `0.11.19`** (PR
+  [#1357](https://github.com/xerj-org/xerj/pull/1357), Tong-bit-art) — resolves
+  five `quinn-proto` advisories (`RUSTSEC-2026-0338` through
+  `RUSTSEC-2026-0342`); the two remaining `quick-xml` advisories blocked by the
+  `calamine =0.26.1` pin stay tracked in
+  [#1358](https://github.com/xerj-org/xerj/issues/1358).
+
 ### Measured
 
 - **The #1062 wrong-and-confident detection gate was run through the real
   `_watcher` path and it FAILS** (issue
-  [#1108](https://github.com/xerj-org/xerj/issues/1108)) — the unmeasured half
+  [#1108](https://github.com/xerj-org/xerj/issues/1108), PR
+  [#1322](https://github.com/xerj-org/xerj/pull/1322)) — the unmeasured half
   of the rc.80 `_watcher` work. On the rc.94 release binary, a real
   `PUT /_watcher/watch` with `condition.xerj_decide` (one detection watch per
   label, one-vs-rest) evaluated a 120-email boundary tier and wrote 120 fire
@@ -26,6 +60,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   detection watch as a "confidently correct" default, and no doc claims it is.
   Raw results, corpus generator and harness in
   `benchmarks/systemone-watcher-gate/`. Closes #1108.
+
+### Documentation & Site
+
+- **Make the Corpus Hub reachable from `llms.txt` with working commands** (PR
+  [#1371](https://github.com/xerj-org/xerj/pull/1371)) — adds the three-command
+  Corpus Hub workflow (`xerj corpus add --from hub/<name>.json`,
+  `xerj corpus index`, `xerj code <name> "<query>"`) directly to
+  `landing/llms.txt` and `landing/llms-full.txt`.
+- **Corpus Hub v2 implementation plan** (PR
+  [#1376](https://github.com/xerj-org/xerj/pull/1376)) — publishes the
+  architecture and milestone plan for scaling the Corpus Hub
+  (`docs/plans/2026-10-13-corpus-hub-v2.md`).
+- **Record that the #1138 session-trajectory corpus gap has been seeded** (issue
+  [#1138](https://github.com/xerj-org/xerj/issues/1138) partial, PR
+  [#1314](https://github.com/xerj-org/xerj/pull/1314)) — updates the published
+  blog post to note the 70-trajectory CC-BY-4.0 pack released in
+  `pack-agent-session-trajectories-2026-10-09` while the external evaluation
+  remains open.
+- **Top-nav links to Corpus Hub, X, and Discord** across all landing pages (PR
+  [#1352](https://github.com/xerj-org/xerj/pull/1352)).
+
+### Community & Field Reports
+
+- Field reports and CLA additions: ES-compat flush-parity verification on rc.95
+  (PRs [#1328](https://github.com/xerj-org/xerj/pull/1328),
+  [#1330](https://github.com/xerj-org/xerj/pull/1330), Tong-bit-art),
+  natural-language search on a Spanish-language R package (PRs
+  [#1366](https://github.com/xerj-org/xerj/pull/1366),
+  [#1367](https://github.com/xerj-org/xerj/pull/1367), sebollin),
+  shared-cluster retrieval and `llms.txt` audit on Cygnus (PR
+  [#1373](https://github.com/xerj-org/xerj/pull/1373), todie), and CLA
+  signature for Tyagiquamar (PR
+  [#1327](https://github.com/xerj-org/xerj/pull/1327)).
+
 ## [1.0.0-rc.95] - 2026-10-12
 
 Window since v1.0.0-rc.94: legacy Microsoft Office support in autoindex,

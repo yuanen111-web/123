@@ -2,10 +2,31 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-10-12 (against `v1.0.0-rc.95` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.95 release-cut roll:
+Last reviewed: 2026-10-14 (against `v1.0.0-rc.96` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298 — closed as abandoned 2026-09-29; the machine check, not the issue, enforces the cadence now). This pass is the rc.96 release-cut roll:
 the open-defects shortlist was re-verified against the live tracker at
-cut time — **nine open** (unchanged from rc.94): #1094, #1108, #1110,
-#1122, #1170, #1183, #1226, #1250, #1267. The window since rc.94 landed
+cut time — **eight open** (#1108 closed inside this window by PR
+[#1322](https://github.com/xerj-org/xerj/pull/1322), which ran and
+published the #1062 wrong-and-confident detection gate through the real
+`_watcher` path): #1094, #1110, #1122, #1170, #1183, #1226, #1250,
+#1267. The window since rc.95 aligned inferred `text` fields with ES's
+`doc_values: false` dynamic-mapping default so `terms` queries on
+dynamically mapped text fields no longer change answers at flush (PR
+[#1329](https://github.com/xerj-org/xerj/pull/1329), with test-fixture
+follow-up PR [#1356](https://github.com/xerj-org/xerj/pull/1356)),
+bumped `quinn-proto` to 0.11.19 for `RUSTSEC-2026-0338`…`-0342` (PR
+[#1357](https://github.com/xerj-org/xerj/pull/1357)), made the Corpus
+Hub reachable from `llms.txt` (PR
+[#1371](https://github.com/xerj-org/xerj/pull/1371)) and top-nav (PR
+[#1352](https://github.com/xerj-org/xerj/pull/1352)), recorded the
+seeded #1138 trajectory pack (PR
+[#1314](https://github.com/xerj-org/xerj/pull/1314)) and the Hub v2 plan
+(PR [#1376](https://github.com/xerj-org/xerj/pull/1376)), and landed
+three agent field reports (PRs
+[#1330](https://github.com/xerj-org/xerj/pull/1330),
+[#1367](https://github.com/xerj-org/xerj/pull/1367),
+[#1373](https://github.com/xerj-org/xerj/pull/1373)). The rc.95 cut's
+record stands as written: **nine open** at that cut (#1094, #1108,
+#1110, #1122, #1170, #1183, #1226, #1250, #1267). The window since rc.94 landed
 legacy Microsoft Office support in `xerj autoindex` — `.xls` (BIFF via
 calamine) and `.doc` (Word 97+ text via the FIB piece table), with OLE2
 containers detected by content and `.epf`/others named and skipped — in
@@ -17,7 +38,7 @@ worker, never the indexer (adversarially verified against four
 allocation and two panic vectors); it was validated end-to-end against a
 real 75 GB Jira/Confluence/GitLab dump (.xls and .doc both produced
 records, nothing crashed). The rc.94 footer sweep also landed (#1325) and
-is now part of the cut recipe. No open defect closed inside this window.
+is now part of the cut recipe. No open defect closed inside that window.
 The rc.94 cut's record stands as written: the window since rc.93 landed
 29 merged PRs. A
 backlog-fix sweep closed six defects inside the window: the hybrid
@@ -335,6 +356,11 @@ load — mostly reframed by #1227: those latencies were the unconditional
 no-match flush that #1225 and #1227 removed the callers of; what stays
 open is the flush itself under concurrent bulk load, measured 14–16 s on
 the corpus-builder node).
+**Closed inside the rc.96 window and recorded in the CHANGELOG, not
+carried here:** #1108 (the #1062 wrong-and-confident detection gate run
+through the real `_watcher` path — 0.2449 at raw `p` ≥ 0.8 vs the ≤ 0.05
+bar, FAIL published under loses-does-not-ship, PR
+[#1322](https://github.com/xerj-org/xerj/pull/1322)).
 **Closed inside the rc.94 window and recorded in the CHANGELOG, not
 carried here:** #1100 (second-brain vocabulary gated by corpus format, PR
 [#1310](https://github.com/xerj-org/xerj/pull/1310)), #1230 (sibling-fork
