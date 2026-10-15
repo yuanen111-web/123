@@ -40110,6 +40110,21 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                 Vec::new();
             for spec in &field_specs {
                 for (field_name, text) in collect_passage_field_texts(&hit.source, spec) {
+                    // `defs` is autoindex's synthetic symbol-list field on
+                    // whole-file code docs whose actual source lives in `body`.
+                    // Ensure `body` is a candidate ahead of `defs` even when a
+                    // query lists `defs^3` first or queries `defs` without
+                    // naming `body` (`xerj search` / `xerj def`, #1365).
+                    if field_name == "defs" && !seen_fields.contains("body") {
+                        for (body_name, body_text) in
+                            collect_passage_field_texts(&hit.source, "body")
+                        {
+                            if seen_fields.insert(body_name.clone()) {
+                                let (lower, map) = build_lower_offset_map(&body_text);
+                                candidates.push((body_name, body_text, lower, map));
+                            }
+                        }
+                    }
                     if seen_fields.insert(field_name.clone()) {
                         let (lower, map) = build_lower_offset_map(&text);
                         candidates.push((field_name, text, lower, map));
@@ -40155,7 +40170,7 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                         // are ASCII in the overwhelming case, and a missed
                         // non-ASCII anchor just skips the refinement, not a
                         // correctness bug.
-                        let (start, end) = weighted_terms
+                        let (start, end, ordinal) = weighted_terms
                             .iter()
                             .find_map(|&(term, _)| {
                                 if term.is_empty() {
@@ -40176,7 +40191,12 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
                                     anchor_end,
                                 )
                             })
-                            .unwrap_or((start, end));
+                            .map(|(r_start, r_end)| {
+                                let r_ordinal =
+                                    text[..r_start].bytes().filter(|&b| b == b'\n').count() as u32;
+                                (r_start, r_end, r_ordinal)
+                            })
+                            .unwrap_or((start, end, ordinal));
                         best = Some((
                             score,
                             PassageMatch {
@@ -56450,6 +56470,82 @@ mod lexical_passage_tests {
             passage.text,
             &body[passage.start_offset as usize..passage.end_offset as usize]
         );
+        assert_eq!(
+            passage.ordinal as usize,
+            body[..passage.start_offset as usize].matches('\n').count(),
+            "ordinal must be recomputed after refine_code_passage widens/snaps start_offset"
+        );
+        assert_eq!(passage.ordinal, 80);
+    }
+
+    /// #1365: when `defs` is listed before `body` (as in `xerj search`'s
+    /// `["name^4", "defs^3", "code^2", "body", "title"]`) or when a query
+    /// matches `defs` without naming `body` (as in `xerj def`), a single-symbol
+    /// match whose window score ties between `defs` and `body` must extract the
+    /// passage from `body` at the declaration's line ordinal, never from the
+    /// synthetic `defs` symbol-list field at `ordinal: 0`.
+    #[test]
+    fn defs_field_never_captures_passage_over_code_body_even_when_listed_first_or_alone() {
+        let body = format!(
+            "{}pub fn check_invariants(x: i32) -> bool {{\n    x > 0\n}}\n{}",
+            "// header filler\n".repeat(40),
+            "// footer filler\n".repeat(40)
+        );
+        let source = json!({
+            "body": body,
+            "defs": "fn check_invariants",
+            "language": "rust",
+            "symbol_count": 1
+        });
+
+        for fields in [
+            vec![
+                "name^4".to_string(),
+                "defs^3".to_string(),
+                "code^2".to_string(),
+                "body".to_string(),
+                "title".to_string(),
+            ],
+            vec![
+                "name^4".to_string(),
+                "defs^3".to_string(),
+                "code^2".to_string(),
+                "title".to_string(),
+            ],
+        ] {
+            let query = QueryNode::MultiMatch {
+                fields,
+                query: "check_invariants".into(),
+                match_type: Default::default(),
+                operator: None,
+                analyzer: None,
+                boost: None,
+                slop: 0,
+                max_expansions: 50,
+                lenient: false,
+            };
+            let hit = Hit {
+                id: "doc-code-1".into(),
+                score: 1.0,
+                source: source.clone(),
+                seq_no: None,
+                version: None,
+                sort: Vec::new(),
+                explain: None,
+                highlight: None,
+                matched_queries: Vec::new(),
+                passage: None,
+            };
+            let out = apply_lexical_passages(vec![hit], &query);
+            let passage = out[0].passage.as_ref().expect("lexical passage filled");
+            assert_eq!(passage.field, "body");
+            assert!(
+                passage.text.starts_with("pub fn check_invariants"),
+                "expected enclosing declaration from body, got {:?}",
+                passage.text
+            );
+            assert_eq!(passage.ordinal, 40);
+        }
     }
 
     /// #174: a document that merely carries a field named `language` (not
