@@ -1,16 +1,27 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Cache-line-aligned wrapper isolating hot seqlock state from waiter-list
+/// and telemetry mutations (adapted from `facebookexperimental/reverie`
+/// `reverie-rpc-transport/src/guest_log/buffer.rs:38-77` and
+/// `reverie-rpc-transport/src/guest_log/buffer/ordered.rs:78-100`, BSD-2-Clause).
+#[repr(C, align(64))]
+struct CacheAligned<T>(T);
+
+struct SeqlockState {
+    generation: AtomicU64,
+    in_flight: AtomicU64,
+    poisoned: std::sync::atomic::AtomicBool,
+}
+
 /// Per-index seqlock-style publication barrier for collection-wide captures.
 /// Writers may overlap, but a reader only accepts a capture made while no
 /// writer was active and the generation remained unchanged.
 pub(crate) struct CollectionPublication {
-    generation: AtomicU64,
-    in_flight: AtomicU64,
-    poisoned: std::sync::atomic::AtomicBool,
-    notify: tokio::sync::Notify,
+    seqlock: CacheAligned<SeqlockState>,
+    notify: CacheAligned<tokio::sync::Notify>,
     #[cfg(test)]
-    reader_admission_attempts: AtomicU64,
+    reader_admission_attempts: CacheAligned<AtomicU64>,
 }
 
 pub(crate) struct CollectionPublicationGuard {
@@ -46,31 +57,34 @@ enum GuardOutcome {
 impl CollectionPublication {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            generation: AtomicU64::new(0),
-            in_flight: AtomicU64::new(0),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
+            seqlock: CacheAligned(SeqlockState {
+                generation: AtomicU64::new(0),
+                in_flight: AtomicU64::new(0),
+                poisoned: std::sync::atomic::AtomicBool::new(false),
+            }),
+            notify: CacheAligned(tokio::sync::Notify::new()),
             #[cfg(test)]
-            reader_admission_attempts: AtomicU64::new(0),
+            reader_admission_attempts: CacheAligned(AtomicU64::new(0)),
         })
     }
 
     pub(crate) fn begin(
         self: &Arc<Self>,
     ) -> Result<CollectionPublicationGuard, CollectionPublicationPoisoned> {
-        if self.poisoned.load(Ordering::Acquire) {
+        let seqlock = &self.seqlock.0;
+        if seqlock.poisoned.load(Ordering::Acquire) {
             return Err(CollectionPublicationPoisoned);
         }
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        seqlock.in_flight.fetch_add(1, Ordering::AcqRel);
+        seqlock.generation.fetch_add(1, Ordering::AcqRel);
         // A concurrent failed publisher may poison after our first check.
         // This writer has not mutated yet, so withdraw cleanly and reject it.
-        if self.poisoned.load(Ordering::Acquire) {
-            self.generation.fetch_add(1, Ordering::Release);
-            let previous = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if seqlock.poisoned.load(Ordering::Acquire) {
+            seqlock.generation.fetch_add(1, Ordering::Release);
+            let previous = seqlock.in_flight.fetch_sub(1, Ordering::AcqRel);
             debug_assert!(previous > 0, "collection publication counter underflow");
             if previous == 1 {
-                self.notify.notify_waiters();
+                self.notify.0.notify_waiters();
             }
             return Err(CollectionPublicationPoisoned);
         }
@@ -81,23 +95,26 @@ impl CollectionPublication {
     }
 
     pub(crate) fn state(&self) -> (u64, u64, bool) {
+        let seqlock = &self.seqlock.0;
         loop {
-            let before = self.generation.load(Ordering::Acquire);
-            let in_flight = self.in_flight.load(Ordering::Acquire);
-            let after = self.generation.load(Ordering::Acquire);
+            let before = seqlock.generation.load(Ordering::Acquire);
+            let in_flight = seqlock.in_flight.load(Ordering::Acquire);
+            let after = seqlock.generation.load(Ordering::Acquire);
             if before == after {
-                return (after, in_flight, self.poisoned.load(Ordering::Acquire));
+                return (after, in_flight, seqlock.poisoned.load(Ordering::Acquire));
             }
+            std::hint::spin_loop();
         }
     }
 
     pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.notify.notified()
+        self.notify.0.notified()
     }
 
     pub(crate) fn try_admit_reader(&self) -> ReadAdmission {
         #[cfg(test)]
         self.reader_admission_attempts
+            .0
             .fetch_add(1, Ordering::Release);
         let (generation, in_flight, poisoned) = self.state();
         if poisoned {
@@ -111,7 +128,7 @@ impl CollectionPublication {
 
     #[cfg(test)]
     pub(crate) fn reader_admission_attempts(&self) -> u64 {
-        self.reader_admission_attempts.load(Ordering::Acquire)
+        self.reader_admission_attempts.0.load(Ordering::Acquire)
     }
 
     pub(crate) fn validate_reader(&self, token: CollectionReadToken) -> ReadAdmission {
@@ -141,13 +158,22 @@ impl CollectionPublicationGuard {
 impl Drop for CollectionPublicationGuard {
     fn drop(&mut self) {
         if self.outcome == GuardOutcome::Pending {
-            self.state.poisoned.store(true, Ordering::Release);
+            self.state.seqlock.0.poisoned.store(true, Ordering::Release);
         }
-        self.state.generation.fetch_add(1, Ordering::Release);
-        let previous = self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.state
+            .seqlock
+            .0
+            .generation
+            .fetch_add(1, Ordering::Release);
+        let previous = self
+            .state
+            .seqlock
+            .0
+            .in_flight
+            .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "collection publication counter underflow");
         if previous == 1 {
-            self.state.notify.notify_waiters();
+            self.state.notify.0.notify_waiters();
         }
     }
 }
@@ -155,6 +181,17 @@ impl Drop for CollectionPublicationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seqlock_and_reader_counters_sit_on_distinct_64_byte_cache_lines() {
+        let state = CollectionPublication::new();
+        let seqlock_line = (&raw const state.seqlock) as usize / 64;
+        let notify_line = (&raw const state.notify) as usize / 64;
+        let reader_line = (&raw const state.reader_admission_attempts) as usize / 64;
+        assert_ne!(seqlock_line, notify_line);
+        assert_ne!(seqlock_line, reader_line);
+        assert_ne!(notify_line, reader_line);
+    }
 
     #[test]
     fn overlapping_writers_keep_capture_unstable_until_last_drop() {

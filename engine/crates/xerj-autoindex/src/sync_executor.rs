@@ -112,35 +112,70 @@ pub struct SnapshotFootprint {
 /// Logical payload accounting for source and prepared-record bytes.
 /// This is deliberately not a filesystem-allocation limit: directory,
 /// manifest, and block-allocation overhead are excluded.
+///
+/// Cache-line-isolated lock-free byte-credit accounting adapted from
+/// `facebookexperimental/reverie` (`reverie-rpc-transport/src/guest_log/buffer/ordered.rs:78-100,396-413,689`,
+/// BSD-2-Clause) so parallel snapshot preparation workers can reserve and roll
+/// back byte budget concurrently without serializing on a mutex.
+#[repr(C, align(64))]
 struct PayloadBudget {
-    used: u64,
+    used: std::sync::atomic::AtomicU64,
     limit: u64,
 }
 
 impl PayloadBudget {
-    fn charge(&mut self, bytes: usize) -> std::io::Result<()> {
+    fn new(limit: u64) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicU64::new(0),
+            limit,
+        }
+    }
+
+    fn used(&self) -> u64 {
+        self.used.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn charge(&self, bytes: usize) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
         let bytes = u64::try_from(bytes)
             .map_err(|_| std::io::Error::other("snapshot payload write length overflow"))?;
-        let next = self
-            .used
-            .checked_add(bytes)
-            .ok_or_else(|| std::io::Error::other("snapshot payload byte count overflow"))?;
-        if next > self.limit {
-            return Err(std::io::Error::other(format!(
-                "snapshot logical payload write of {bytes} bytes would raise staged payload from \
-                 {} to {next} bytes, exceeding configured limit of {} bytes; no generation was \
-                 committed and the partial snapshot is removed automatically",
-                self.used, self.limit
-            )));
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .ok_or_else(|| std::io::Error::other("snapshot payload byte count overflow"))?;
+            if next > self.limit {
+                return Err(std::io::Error::other(format!(
+                    "snapshot logical payload write of {bytes} bytes would raise staged payload from \
+                     {current} to {next} bytes, exceeding configured limit of {} bytes; no generation was \
+                     committed and the partial snapshot is removed automatically",
+                    self.limit
+                )));
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => {
+                    current = actual;
+                    std::hint::spin_loop();
+                }
+            }
         }
-        self.used = next;
-        Ok(())
+    }
+
+    fn refund(&self, bytes: u64) {
+        self.used
+            .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
 struct BudgetWriter<'a, W> {
     inner: W,
-    budget: &'a mut PayloadBudget,
+    budget: &'a PayloadBudget,
 }
 
 impl<W: Write> Write for BudgetWriter<'_, W> {
@@ -149,11 +184,11 @@ impl<W: Write> Write for BudgetWriter<'_, W> {
         match self.inner.write(buf) {
             Ok(written) if written == buf.len() => Ok(written),
             Ok(written) => {
-                self.budget.used -= (buf.len() - written) as u64;
+                self.budget.refund((buf.len() - written) as u64);
                 Ok(written)
             }
             Err(error) => {
-                self.budget.used -= buf.len() as u64;
+                self.budget.refund(buf.len() as u64);
                 Err(error)
             }
         }
@@ -355,38 +390,109 @@ pub(crate) fn replay_windowed<T: Sync>(
         }
         return Ok(());
     }
+    // Bounded worker pool + ordered sequence collector adapted from
+    // `facebookexperimental/reverie` (`reverie-rpc-transport/src/guest_log/buffer/ordered.rs:702-703,875-884,924-943`
+    // and `reverie-rpc-transport/src/mapped/workers.rs:56-103`, BSD-2-Clause):
+    // reuse at most `width.min(items.len())` OS worker threads instead of
+    // spawning and joining one OS thread per item, and buffer out-of-order
+    // completions in a `BTreeMap<usize, Result<()>>` drained contiguously from
+    // `next_commit` so journal commits remain strictly ordered within the
+    // `width` sequence-credit window.
+    let worker_count = width.min(items.len());
     let failure = std::thread::scope(|scope| -> Result<Option<anyhow::Error>> {
-        let mut next = items.iter();
-        let mut in_flight: std::collections::VecDeque<(
-            &T,
-            std::thread::ScopedJoinHandle<'_, Result<()>>,
-        )> = std::collections::VecDeque::new();
+        let work_queue = std::sync::Arc::new((
+            std::sync::Mutex::new((
+                std::collections::VecDeque::<(usize, &T)>::with_capacity(width),
+                false,
+            )),
+            std::sync::Condvar::new(),
+        ));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, Result<()>)>();
+        for _ in 0..worker_count {
+            let work_queue = std::sync::Arc::clone(&work_queue);
+            let done_tx = done_tx.clone();
+            scope.spawn(move || loop {
+                let task = {
+                    let (lock, cvar) = &*work_queue;
+                    let mut guard = lock.lock().unwrap();
+                    while guard.0.is_empty() && !guard.1 {
+                        guard = cvar.wait(guard).unwrap();
+                    }
+                    if let Some(task) = guard.0.pop_front() {
+                        task
+                    } else {
+                        break;
+                    }
+                };
+                let (seq, item) = task;
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(item)))
+                        .unwrap_or_else(|panic| {
+                            Err(anyhow::anyhow!(
+                                "replay apply panicked: {}",
+                                panic_message(panic)
+                            ))
+                        });
+                if done_tx.send((seq, outcome)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(done_tx);
+
+        let mut next_dispatch = 0usize;
+        let mut next_commit = 0usize;
+        let mut in_flight = 0usize;
+        let mut pending: BTreeMap<usize, Result<()>> = BTreeMap::new();
         let mut failure: Option<anyhow::Error> = None;
+
         loop {
-            while failure.is_none() && in_flight.len() < width {
+            while failure.is_none()
+                && next_dispatch < items.len()
+                && (next_dispatch - next_commit) < width
+            {
                 // `begin` is the Started write: it happens on THIS thread,
                 // before the operation exists remotely, so an operation that
                 // was never dispatched is also never recorded as begun.
-                let Some(item) = next.next() else { break };
-                hooks.begin(item)?;
-                let dispatched = item;
-                in_flight.push_back((item, scope.spawn(move || apply(dispatched))));
+                let item = &items[next_dispatch];
+                if let Err(error) = hooks.begin(item) {
+                    let (lock, cvar) = &*work_queue;
+                    lock.lock().unwrap().1 = true;
+                    cvar.notify_all();
+                    return Err(error);
+                }
+                let seq = next_dispatch;
+                next_dispatch += 1;
+                in_flight += 1;
+                let (lock, cvar) = &*work_queue;
+                lock.lock().unwrap().0.push_back((seq, item));
+                cvar.notify_one();
             }
-            let Some((item, handle)) = in_flight.pop_front() else {
+
+            if in_flight == 0 && pending.is_empty() {
                 break;
-            };
-            let outcome = handle.join().unwrap_or_else(|panic| {
-                Err(anyhow::anyhow!(
-                    "replay apply panicked: {}",
-                    panic_message(panic)
-                ))
-            });
-            let reported = hooks.applied(item, outcome);
-            if let (None, Err(error)) = (&failure, reported) {
-                // First failure stops dispatch; the drain still reports.
-                failure = Some(error);
+            }
+
+            let (seq, outcome) = done_rx
+                .recv()
+                .expect("worker pool stays alive while in_flight > 0");
+            in_flight -= 1;
+            pending.insert(seq, outcome);
+
+            while let Some(outcome) = pending.remove(&next_commit) {
+                let item = &items[next_commit];
+                next_commit += 1;
+                let reported = hooks.applied(item, outcome);
+                if let (None, Err(error)) = (&failure, reported) {
+                    // First failure stops dispatch; the drain still reports.
+                    failure = Some(error);
+                }
             }
         }
+
+        let (lock, cvar) = &*work_queue;
+        lock.lock().unwrap().1 = true;
+        cvar.notify_all();
         Ok(failure)
     })?;
     match failure {
@@ -2545,10 +2651,8 @@ fn create_snapshot_inner(
              {hard_budget_bytes} bytes before preparation"
         );
     }
-    let mut budget = PayloadBudget {
-        used: 0,
-        limit: hard_budget_bytes,
-    };
+    let budget = PayloadBudget::new(hard_budget_bytes);
+    let lookup = plan.map(PreparationLookup::new).transpose()?;
     // #971: the reuse index. Sealing is O(corpus) because every file is
     // re-copied, re-verified and re-extracted per generation — a one-file
     // change in a 10,000-file corpus sealed 10,000 blobs twice over (verify,
@@ -2573,17 +2677,13 @@ fn create_snapshot_inner(
                 .collect()
         })
         .unwrap_or_default();
-    let mut files = Vec::with_capacity(inventory.files.len());
     // Entered only when there is work to report: a retry that reuses a verified
     // final snapshot returned above and never claims a phase it did not run.
     pr.phase("snapshot", inventory.files.len() as u64, source_bytes);
-    for (ordinal, ((source, content_id), content_digest)) in inventory
-        .files
-        .iter()
-        .zip(&inventory.keys)
-        .zip(&inventory.digests)
-        .enumerate()
-    {
+    let seal_one = |ordinal: usize| -> Result<SnapshotFile> {
+        let source = &inventory.files[ordinal];
+        let content_id = &inventory.keys[ordinal];
+        let content_digest = &inventory.digests[ordinal];
         // Counted done on every exit from this iteration, including the `?`s:
         // the phase measures files drained, and the guard names the file a
         // quiet tail is inside.
@@ -2598,10 +2698,10 @@ fn create_snapshot_inner(
         // mutable tree, and the inventory it is verified against lists the
         // file), but there is nothing to prepare for it: `prepared: None`.
         let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
-        let prepared_identity = match (plan, assignment) {
-            (Some(plan), Some(assignment)) => Some(prepared_artifact_identity(
+        let prepared_identity = match (lookup.as_ref(), assignment) {
+            (Some(lookup), Some(assignment)) => Some(prepared_artifact_identity(
                 chunker_identity,
-                plan,
+                lookup,
                 content_id.as_str(),
                 assignment,
             )?),
@@ -2661,60 +2761,75 @@ fn create_snapshot_inner(
                         })
                     }
                     _ => match assignment {
-                        Some(_) => Some(prepare_artifact(
+                        Some(assignment) => Some(prepare_artifact(
                             &staging,
                             ordinal,
                             tx_id,
                             source,
                             content_id,
                             &destination,
-                            plan.expect("assignment implies a plan"),
-                            &mut budget,
+                            assignment,
+                            lookup.as_ref().expect("assignment implies a plan"),
+                            &budget,
                             labeler,
                         )?),
                         None => None,
                     },
                 };
-                files.push(SnapshotFile {
+                Ok(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
                     content_size: source.size,
                     relative_blob,
                     prepared,
                     prepared_identity,
-                });
+                })
             }
             None => {
                 crate::content::verify(&source.path, source.size, content_digest)?;
-                copy_synced(&source.path, &destination, &mut budget)?;
+                copy_synced(&source.path, &destination, &budget)?;
                 crate::content::verify(&destination, source.size, content_digest)?;
                 #[cfg(test)]
                 apply_post_seal_source_replacement(&source.path)?;
                 let prepared = match assignment {
-                    Some(_) => Some(prepare_artifact(
+                    Some(assignment) => Some(prepare_artifact(
                         &staging,
                         ordinal,
                         tx_id,
                         source,
                         content_id,
                         &destination,
-                        plan.expect("assignment implies a plan"),
-                        &mut budget,
+                        assignment,
+                        lookup.as_ref().expect("assignment implies a plan"),
+                        &budget,
                         labeler,
                     )?),
                     None => None,
                 };
-                files.push(SnapshotFile {
+                Ok(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
                     content_size: source.size,
                     relative_blob,
                     prepared,
                     prepared_identity,
-                });
+                })
             }
         }
-    }
+    };
+    let files: Vec<SnapshotFile> = if inventory.files.len() <= 1 {
+        (0..inventory.files.len())
+            .map(seal_one)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        use rayon::prelude::*;
+        crate::pool::install(|| {
+            (0..inventory.files.len())
+                .into_par_iter()
+                .map(seal_one)
+                .collect::<Result<Vec<_>>>()
+        })?
+    };
     let prepared_bytes = files.iter().try_fold(0u64, |total, file| {
         total
             .checked_add(file.prepared.as_ref().map_or(0, |artifact| artifact.bytes))
@@ -2724,7 +2839,7 @@ fn create_snapshot_inner(
         .checked_add(prepared_bytes)
         .context("total snapshot byte overflow")?;
     anyhow::ensure!(
-        total_bytes == budget.used && total_bytes <= hard_budget_bytes,
+        total_bytes == budget.used() && total_bytes <= hard_budget_bytes,
         "snapshot logical payload accounting mismatch"
     );
     let footprint = SnapshotFootprint {
@@ -2829,6 +2944,43 @@ pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
     Ok(snapshot)
 }
 
+struct PreparationLookup<'a> {
+    datasets: HashMap<&'a str, &'a crate::state::PlanDataset>,
+    dataset_values: HashMap<&'a str, Value>,
+    coercions: HashMap<&'a str, HashMap<String, crate::coerce::Coerce>>,
+    aliases_by_key: HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+}
+
+impl<'a> PreparationLookup<'a> {
+    fn new(plan: &'a Plan) -> Result<Self> {
+        let mut datasets = HashMap::with_capacity(plan.datasets.len());
+        let mut dataset_values = HashMap::with_capacity(plan.datasets.len());
+        let mut coercions = HashMap::with_capacity(plan.datasets.len());
+        for dataset in &plan.datasets {
+            let slug = dataset.slug.as_str();
+            datasets.insert(slug, dataset);
+            dataset_values.insert(slug, serde_json::to_value(dataset)?);
+            coercions.insert(slug, crate::coerce::plan_from_specs(&dataset.specs));
+        }
+        let mut aliases_by_key: HashMap<&'a str, Vec<(&'a str, &'a str)>> = HashMap::new();
+        for alias in &plan.duplicate_files {
+            aliases_by_key
+                .entry(alias.file_key.as_str())
+                .or_default()
+                .push((alias.rel.as_str(), alias.path_id.as_str()));
+        }
+        for aliases in aliases_by_key.values_mut() {
+            aliases.sort_unstable();
+        }
+        Ok(Self {
+            datasets,
+            dataset_values,
+            coercions,
+            aliases_by_key,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_artifact(
     staging: &Path,
@@ -2837,8 +2989,9 @@ fn prepare_artifact(
     source: &crate::walk::FileEntry,
     content_id: &str,
     snapshot_blob: &Path,
-    plan: &Plan,
-    budget: &mut PayloadBudget,
+    assignment: &crate::state::FileAssignment,
+    lookup: &PreparationLookup<'_>,
+    budget: &PayloadBudget,
     // #1062: `--label` runs each record's payload through the node's
     // `/_decide` HERE, before the record is sealed, so the labels become part
     // of the durable artifact — replays and hardlink reuse carry them without
@@ -2849,32 +3002,12 @@ fn prepare_artifact(
     // without `--label` — seals unlabelled exactly as before.
     labeler: Option<&crate::label::Labeler>,
 ) -> Result<PreparedArtifact> {
-    let assignment = plan
-        .files
-        .get(content_id)
-        .with_context(|| format!("plan has no assignment for {}", source.rel))?;
-    let datasets: HashMap<&str, &crate::state::PlanDataset> = plan
-        .datasets
-        .iter()
-        .map(|dataset| (dataset.slug.as_str(), dataset))
-        .collect();
-    let coercions: HashMap<&str, HashMap<String, crate::coerce::Coerce>> = plan
-        .datasets
-        .iter()
-        .map(|dataset| {
-            (
-                dataset.slug.as_str(),
-                crate::coerce::plan_from_specs(&dataset.specs),
-            )
-        })
-        .collect();
+    let datasets = &lookup.datasets;
+    let coercions = &lookup.coercions;
     let mut paths = vec![assignment.rel.clone()];
-    paths.extend(
-        plan.duplicate_files
-            .iter()
-            .filter(|alias| alias.file_key == content_id)
-            .map(|alias| alias.rel.clone()),
-    );
+    if let Some(aliases) = lookup.aliases_by_key.get(content_id) {
+        paths.extend(aliases.iter().map(|(rel, _)| (*rel).to_owned()));
+    }
     paths.sort();
     paths.dedup();
     let assignments: HashMap<Option<String>, &str> = assignment
@@ -3061,29 +3194,19 @@ fn prepare_artifact(
 /// behaviour change, which is what makes this safe across builds.
 fn prepared_artifact_identity(
     chunker_identity: &str,
-    plan: &Plan,
+    lookup: &PreparationLookup<'_>,
     content_id: &str,
     assignment: &crate::state::FileAssignment,
 ) -> Result<String> {
-    let mut aliases: Vec<(&str, &str)> = plan
-        .duplicate_files
-        .iter()
-        .filter(|alias| alias.file_key == content_id)
-        .map(|alias| (alias.rel.as_str(), alias.path_id.as_str()))
-        .collect();
-    aliases.sort_unstable();
-    let slugs: BTreeSet<&str> = assignment
-        .assignments
-        .iter()
-        .map(|(_, slug)| slug.as_str())
-        .collect();
-    let mut datasets: BTreeMap<&str, Value> = BTreeMap::new();
-    for dataset in plan
-        .datasets
-        .iter()
-        .filter(|dataset| slugs.contains(&dataset.slug.as_str()))
-    {
-        datasets.insert(dataset.slug.as_str(), serde_json::to_value(dataset)?);
+    let aliases: &[(&str, &str)] = lookup
+        .aliases_by_key
+        .get(content_id)
+        .map_or(&[], Vec::as_slice);
+    let mut datasets: BTreeMap<&str, &Value> = BTreeMap::new();
+    for (_, slug) in &assignment.assignments {
+        if let Some(value) = lookup.dataset_values.get(slug.as_str()) {
+            datasets.insert(slug.as_str(), value);
+        }
     }
     let encoded = serde_json::to_vec(&serde_json::json!({
         "chunker_identity": chunker_identity,
@@ -3168,7 +3291,7 @@ fn validate_tx_id(tx_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn copy_synced(source: &Path, destination: &Path, budget: &mut PayloadBudget) -> Result<()> {
+fn copy_synced(source: &Path, destination: &Path, budget: &PayloadBudget) -> Result<()> {
     let mut input = File::open(source)?;
     let output = OpenOptions::new()
         .create_new(true)
@@ -4291,17 +4414,17 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let path = state.path().join("payload");
         let file = File::create(&path).unwrap();
-        let mut budget = PayloadBudget { used: 0, limit: 3 };
+        let budget = PayloadBudget::new(3);
         let mut writer = BudgetWriter {
             inner: file,
-            budget: &mut budget,
+            budget: &budget,
         };
         writer.write_all(b"abc").unwrap();
         assert!(writer.write_all(b"d").is_err());
         writer.flush().unwrap();
         drop(writer);
         assert_eq!(std::fs::metadata(path).unwrap().len(), 3);
-        assert_eq!(budget.used, 3);
+        assert_eq!(budget.used(), 3);
     }
 
     #[test]
@@ -4730,6 +4853,40 @@ mod tests {
             seen_threads.lock().unwrap().len(),
             1,
             "width 1 runs every apply on the calling thread"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_reuses_bounded_worker_pool_across_many_items() {
+        let items: Vec<usize> = (0..64).collect();
+        let mut hooks = WindowHooks::default();
+        let seen_threads =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let apply_of = std::sync::Arc::clone(&seen_threads);
+        let apply = move |item: &usize| {
+            apply_of.lock().unwrap().insert(std::thread::current().id());
+            if item.is_multiple_of(3) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Ok(())
+        };
+        replay_windowed(&items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, ok)| {
+                    assert!(*ok);
+                    *item
+                })
+                .collect::<Vec<_>>(),
+            items
+        );
+        let thread_count = seen_threads.lock().unwrap().len();
+        assert!(
+            thread_count <= 4,
+            "expected at most 4 worker threads for 64 items at width=4, saw {thread_count}"
         );
     }
 

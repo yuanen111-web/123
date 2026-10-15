@@ -237,6 +237,22 @@ pub enum FlushFinalizeOutcome {
 /// scan iterating this snapshot's segment list can always open every
 /// segment it references.  Dropping the last guard sweeps the graveyard.
 ///
+/// 64-byte cache-line-aligned wrapper adapted from `facebookexperimental/reverie`
+/// (`reverie-rpc-transport/src/guest_log/buffer.rs:38-77` and
+/// `reverie-rpc-transport/src/guest_log/buffer/ordered.rs:78-100`, BSD-2-Clause)
+/// to isolate hot per-shard memtable locks, byte counters, and reader lease
+/// counters onto separate L1/L2 cache lines.
+#[repr(C, align(64))]
+struct CacheAligned<T>(T);
+
+impl<T> std::ops::Deref for CacheAligned<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Derefs to `Arc<IndexSnapshot>` exactly like the
 /// `arc_swap::Guard<Arc<IndexSnapshot>>` it wraps, so call sites are
 /// source-compatible with the pre-lease `snapshot()`.
@@ -255,12 +271,21 @@ impl std::ops::Deref for SnapshotReadGuard<'_> {
 impl Drop for SnapshotReadGuard<'_> {
     fn drop(&mut self) {
         // Last lease out sweeps the graveyard.  `fetch_sub` returning 1
-        // means this was the final outstanding lease.
+        // means this was the final outstanding lease.  Fast-path check
+        // `retired_segments_non_empty` with `SeqCst` store-then-load ordering
+        // adapted from `facebookexperimental/reverie`
+        // (`reverie-rpc-transport/src/mapped.rs:116-143`, BSD-2-Clause) so
+        // reader lease drops do not lock `retired_segments` on every query
+        // when no segments are awaiting retirement.
         if self
             .store
             .read_leases
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             == 1
+            && self
+                .store
+                .retired_segments_non_empty
+                .load(std::sync::atomic::Ordering::SeqCst)
         {
             self.store.sweep_retired_segments();
         }
@@ -559,10 +584,14 @@ pub struct IndexStore {
     /// lock protects both the WAL-seq ordering and the memtable push.
     /// Sharding lets N concurrent bulk clients hit N different shards
     /// without serialising on a single global mutex — measured ~3-4×
-    /// ingest scaling on multi-client benchmarks.
-    memtable_shards: Vec<Mutex<Vec<MemEntry>>>,
-    /// Aggregate estimated byte size across all shards.
-    memtable_bytes: AtomicU64,
+    /// ingest scaling on multi-client benchmarks. Each shard mutex is
+    /// cache-line-aligned (`CacheAligned`) to prevent false sharing
+    /// between adjacent shards under concurrent `_bulk` ingest.
+    memtable_shards: Vec<CacheAligned<Mutex<Vec<MemEntry>>>>,
+    /// Aggregate estimated byte size across all shards (isolated onto its
+    /// own 64-byte cache line so writer `fetch_add` does not invalidate
+    /// adjacent reader-hot fields).
+    memtable_bytes: CacheAligned<AtomicU64>,
     /// M5.20 — hold-open SegmentReader cache.
     ///
     /// Pre-M5.20 `open_segment` re-opened (File::open + mmap + full-file
@@ -592,7 +621,11 @@ pub struct IndexStore {
     /// as it keeps the guard, and retired (merged-away) segment files are
     /// only unlinked once this count reaches zero.  See
     /// `retire_segment_files` for the full race description.
-    read_leases: std::sync::atomic::AtomicUsize,
+    read_leases: CacheAligned<std::sync::atomic::AtomicUsize>,
+    /// Fast-path indicator that `retired_segments` holds at least one entry,
+    /// avoiding a mutex acquisition on every `SnapshotReadGuard` drop when the
+    /// graveyard is empty.
+    retired_segments_non_empty: AtomicBool,
     /// Graveyard of segment ids retired by `apply_merge` whose on-disk
     /// files could not be deleted immediately because a read lease was
     /// outstanding.  Swept (files unlinked, reader-cache entries evicted)
@@ -835,8 +868,9 @@ impl IndexStore {
         let version_map = Arc::new(VersionMap::new());
 
         let num_shards = config.num_wal_shards.max(1).next_power_of_two();
-        let memtable_shards: Vec<Mutex<Vec<MemEntry>>> =
-            (0..num_shards).map(|_| Mutex::new(Vec::new())).collect();
+        let memtable_shards: Vec<CacheAligned<Mutex<Vec<MemEntry>>>> = (0..num_shards)
+            .map(|_| CacheAligned(Mutex::new(Vec::new())))
+            .collect();
         let store = Arc::new(Self {
             data_dir: data_dir.clone(),
             config,
@@ -852,14 +886,15 @@ impl IndexStore {
             version_map: Arc::clone(&version_map),
             seq_counter,
             memtable_shards,
-            memtable_bytes: AtomicU64::new(0),
+            memtable_bytes: CacheAligned(AtomicU64::new(0)),
             // #873 — per-index map: capped shard array, see
             // `xerj_common::resource::per_index_map_shards`.
             seg_reader_cache: dashmap::DashMap::with_shard_amount(
                 xerj_common::resource::per_index_map_shards(),
             ),
             last_wal_maintenance_ms: AtomicU64::new(0),
-            read_leases: std::sync::atomic::AtomicUsize::new(0),
+            read_leases: CacheAligned(std::sync::atomic::AtomicUsize::new(0)),
+            retired_segments_non_empty: AtomicBool::new(false),
             retired_segments: Mutex::new(Vec::new()),
             segments_changed_hook: Mutex::new(None),
             pending_deletes: Mutex::new(std::collections::HashMap::new()),
@@ -1708,6 +1743,8 @@ impl IndexStore {
         {
             let mut graveyard = self.retired_segments.lock().unwrap();
             graveyard.extend_from_slice(segment_ids);
+            self.retired_segments_non_empty
+                .store(!graveyard.is_empty(), std::sync::atomic::Ordering::SeqCst);
         }
         // Opportunistic sweep: deletes right away when no reader is active
         // (the common case), otherwise the last lease drop sweeps.
@@ -1730,9 +1767,14 @@ impl IndexStore {
             if graveyard.is_empty()
                 || self.read_leases.load(std::sync::atomic::Ordering::SeqCst) != 0
             {
+                self.retired_segments_non_empty
+                    .store(!graveyard.is_empty(), std::sync::atomic::Ordering::SeqCst);
                 return (0, 0);
             }
-            graveyard.drain(..).collect()
+            let drained = graveyard.drain(..).collect();
+            self.retired_segments_non_empty
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            drained
         };
         // Evict any reader-cache entries a leased scan may have re-opened
         // for these ids so their mmaps (and the unlinked blocks) get
@@ -1858,14 +1900,19 @@ impl IndexStore {
         }
 
         // Version map + memtable updates — each doc routed to its
-        // own shard.  We acquire each shard lock lazily so that most
-        // pushes (small batches) only touch 1-2 shards.
+        // own shard.  Hoist `Arc<str>` for `IN_MEMORY_SEGMENT_ID` and
+        // `Arc<[u8]>` for empty `source_bytes` once per batch, and batch
+        // the `memtable_bytes.fetch_add` into a single atomic RMW.
+        let in_memory_seg: std::sync::Arc<str> = std::sync::Arc::from(IN_MEMORY_SEGMENT_ID);
+        let empty_source_bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(&[][..]);
+        let mut total_charge = 0u64;
         for (i, (doc_id, source)) in docs.iter().enumerate() {
             let seq_no = seq_nos[i];
             self.version_map
-                .set(doc_id, seq_no, IN_MEMORY_SEGMENT_ID, false);
-            let source_bytes = std::sync::Arc::from(&[][..]);
+                .set(doc_id, seq_no, std::sync::Arc::clone(&in_memory_seg), false);
+            let source_bytes = std::sync::Arc::clone(&empty_source_bytes);
             let charge = MemEntry::charge_for(source, &source_bytes);
+            total_charge = total_charge.saturating_add(charge);
             let shard = self.shard_for(doc_id);
             let mut mem = self.memtable_shards[shard].lock().unwrap();
             mem.push(MemEntry {
@@ -1875,8 +1922,10 @@ impl IndexStore {
                 source_bytes,
                 charge,
             });
-            drop(mem);
-            self.memtable_bytes.fetch_add(charge, Ordering::Relaxed);
+        }
+        if total_charge > 0 {
+            self.memtable_bytes
+                .fetch_add(total_charge, Ordering::Relaxed);
         }
 
         Ok(seq_nos)
@@ -7959,5 +8008,30 @@ mod tests {
         );
         let resident = store.resident_memtable_entries();
         assert_eq!(resident, 2, "the live write and the tombstone stay");
+    }
+
+    #[test]
+    fn memtable_shards_and_read_leases_sit_on_distinct_64_byte_cache_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = IndexStore::open(
+            dir.path(),
+            IndexStoreConfig {
+                num_wal_shards: 4,
+                ..IndexStoreConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(store.memtable_shards.len() >= 4);
+        for pair in store.memtable_shards.windows(2) {
+            let line_a = (&raw const pair[0]) as usize / 64;
+            let line_b = (&raw const pair[1]) as usize / 64;
+            assert_ne!(
+                line_a, line_b,
+                "adjacent memtable shards must not share a 64B cache line"
+            );
+        }
+        let bytes_line = (&raw const store.memtable_bytes) as usize / 64;
+        let leases_line = (&raw const store.read_leases) as usize / 64;
+        assert_ne!(bytes_line, leases_line);
     }
 }

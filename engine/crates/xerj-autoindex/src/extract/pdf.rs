@@ -455,7 +455,7 @@ impl ExtractionSpoolBudget {
         let _admission = self.admission.lock().unwrap();
         let previous_spools = self
             .spools
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |spools| {
                 (spools < self.max_spools).then_some(spools + 1)
             })
             .map_err(|_| {
@@ -956,11 +956,33 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
     })?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
-    let out_reader = std::thread::spawn(move || read_capped(stdout, MAX_WORKER_OUTPUT));
-    let err_reader = std::thread::spawn(move || read_capped(stderr, MAX_WORKER_STDERR as usize));
+    // Event-driven pipe EOF wakeup adapted from facebookexperimental/reverie
+    // (reverie-rpc-transport/src/mapped/workers.rs:66-103, BSD-2-Clause):
+    // wake the parent supervisor immediately on pipe closure instead of
+    // paying a blind 20ms sleep penalty on every fast PDF worker exit.
+    let eof_signal = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let out_signal = Arc::clone(&eof_signal);
+    let err_signal = Arc::clone(&eof_signal);
+    let out_reader = std::thread::spawn(move || {
+        let res = read_capped(stdout, MAX_WORKER_OUTPUT);
+        if let Ok(mut done) = out_signal.0.lock() {
+            *done += 1;
+            out_signal.1.notify_all();
+        }
+        res
+    });
+    let err_reader = std::thread::spawn(move || {
+        let res = read_capped(stderr, MAX_WORKER_STDERR as usize);
+        if let Ok(mut done) = err_signal.0.lock() {
+            *done += 1;
+            err_signal.1.notify_all();
+        }
+        res
+    });
 
     let started = Instant::now();
     let timeout = Duration::from_secs(WORKER_TIMEOUT_SECS.load(Ordering::Relaxed));
+    let mut seen_eof = 0usize;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -974,7 +996,8 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
                 });
             }
         }
-        if started.elapsed() >= timeout {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
             terminate_worker_tree(&mut child);
             let _ = out_reader.join();
             let _ = err_reader.join();
@@ -984,7 +1007,20 @@ fn spawn_worker(path: &Path) -> Result<WorkerResponse> {
                 path.display()
             ));
         }
-        std::thread::sleep(Duration::from_millis(20));
+        let wait_slice = timeout
+            .saturating_sub(elapsed)
+            .min(Duration::from_millis(20));
+        if let Ok(done) = eof_signal.0.lock() {
+            if *done == seen_eof {
+                if let Ok((done, _)) = eof_signal.1.wait_timeout(done, wait_slice) {
+                    seen_eof = *done;
+                }
+            } else {
+                seen_eof = *done;
+            }
+        } else {
+            std::thread::sleep(wait_slice);
+        }
     };
     terminate_worker_descendants(child.id());
     let stdout = out_reader
