@@ -23727,6 +23727,13 @@ impl Index {
                         }
                         match &sort_cand {
                             Some(sc) => Some(Arc::new(PrefilterSet::from_set(sc.set.clone()))),
+                            // An analyzed `text` field's column holds raw
+                            // values, not tokens: its term set is not a
+                            // superset of the scan's matches, so decline
+                            // (`None` → full stored scan, which answers per
+                            // the pre-flush hit set — see
+                            // `field_is_analyzed_text`).
+                            None if field_is_analyzed_text(&dmq_schema, field) => None,
                             None => self.build_term_prefilter_cached(
                                 &segments_dir,
                                 &seg_id,
@@ -23753,6 +23760,10 @@ impl Index {
                         }
                         match &sort_cand {
                             Some(sc) => Some(Arc::new(PrefilterSet::from_set(sc.set.clone()))),
+                            // Same analyzed-`text` decline as the Term arm
+                            // above: the column stores raw values, so a set
+                            // built from it would drop every token-only match.
+                            None if field_is_analyzed_text(&dmq_schema, field) => None,
                             None => self.build_term_prefilter_cached(
                                 &segments_dir,
                                 &seg_id,
@@ -23778,7 +23789,16 @@ impl Index {
                         // Pure-conjunction bool: parse only the most-selective
                         // conjunct's docs; `doc_matches_query` re-tests the full
                         // bool per admitted doc (superset filter).
-                        self.build_bool_prefilter_cached(&segments_dir, &seg_id, query)
+                        //
+                        // A bool carrying a term/terms leaf on an analyzed
+                        // `text` field has no valid doc-values anchor at all
+                        // (see `field_is_analyzed_text`) — decline the whole
+                        // prefilter, the stored scan answers.
+                        if has_analyzed_text_term_leaf(query, &dmq_schema) {
+                            None
+                        } else {
+                            self.build_bool_prefilter_cached(&segments_dir, &seg_id, query)
+                        }
                     } else if is_match_all && !deletes_present {
                         // Sorted-DV candidate pruning for field-sorted
                         // match_all: the segment's sorted numeric
@@ -27505,6 +27525,17 @@ impl Index {
             QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => query.as_ref(),
             _ => query,
         };
+        // Analyzed-text leaves first: every count below is built from
+        // doc-values columns, and those are exact only where the column holds
+        // what `_search` matches. For a `text` field with doc-values the
+        // column holds RAW values while the scan matches TOKENS, so any count
+        // derived from it (the Term/Terms arms and the Bool arm's resolver)
+        // would drop exactly the token-only matches the pre-flush answer has.
+        // Decline the whole shortcut and let the counting scan answer — the
+        // same `None` route a field with no column already takes.
+        if has_analyzed_text_term_leaf(query, schema) {
+            return None;
+        }
         // Bool intersection shortcut — for `bool { must: [Term, Range] }`
         // (the most common production filter shape) compute the matching
         // doc-id set per segment via doc-values intersection, no scan.
@@ -41428,6 +41459,74 @@ fn declared_field<'a>(schema: &'a Schema, field: &str) -> Option<&'a FieldConfig
         None
     }
     find(&schema.fields, &field.split('.').collect::<Vec<_>>())
+}
+
+/// Is `field` an ANALYZED `text` field in `schema`?
+///
+/// Such a field's doc-values column — when its mapping asks for one (ES's
+/// `mapper.text.doc_values`) — holds the RAW `_source` values, while `_search`
+/// resolves a `term`/`terms` leaf against the analyzed token stream
+/// (`tokens_contain` in `doc_matches_query_typed` — the answer the memtable
+/// gives before any flush). A set built from the column is therefore NOT a
+/// superset of the segment's matches, and every consumer that treats it as one
+/// (the term/terms prefilters, the doc-values count shortcuts) silently drops
+/// the token-only matches once the document flushes. Those paths must decline
+/// and let the stored scan answer.
+///
+/// Only INDEXED text qualifies. An `"index": false` text field with doc-values
+/// has no token stream to match against: ES answers `term`/`terms` on it from
+/// the column, by whole value (`aggregations/terms_text_docvalues.yml`), so the
+/// column-derived set is exactly right there and must keep being used.
+fn field_is_analyzed_text(schema: &Schema, field: &str) -> bool {
+    declared_field(schema, field)
+        .is_some_and(|f| matches!(f.field_type, FieldType::Text) && f.options.indexed)
+}
+
+/// Does `q` carry a `term`/`terms` leaf naming an analyzed `text` field?
+///
+/// The doc-values shapes [`field_is_analyzed_text`] cannot resolve are
+/// declined as a whole when this is true. Mirrors the composite arms of
+/// `unsearchable_query_field` so every position a leaf can sit in is walked.
+fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
+    match q {
+        QueryNode::Term { field, .. } | QueryNode::Terms { field, .. } => {
+            field_is_analyzed_text(schema, field)
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .any(|c| has_analyzed_text_term_leaf(c, schema)),
+        QueryNode::Constant { query, .. }
+        | QueryNode::Boosted { query, .. }
+        | QueryNode::Named { query, .. }
+        | QueryNode::Nested { query, .. }
+        | QueryNode::FunctionScore { query, .. } => has_analyzed_text_term_leaf(query, schema),
+        QueryNode::Pinned { organic, .. } => has_analyzed_text_term_leaf(organic, schema),
+        QueryNode::Boosting {
+            positive, negative, ..
+        } => {
+            has_analyzed_text_term_leaf(positive, schema)
+                || has_analyzed_text_term_leaf(negative, schema)
+        }
+        QueryNode::DisMax { queries, .. } => queries
+            .iter()
+            .any(|c| has_analyzed_text_term_leaf(c, schema)),
+        QueryNode::Hybrid { queries, .. } => queries
+            .iter()
+            .any(|wq| has_analyzed_text_term_leaf(&wq.query, schema)),
+        QueryNode::Knn { filter, .. } | QueryNode::SemanticSearch { filter, .. } => filter
+            .as_ref()
+            .is_some_and(|f| has_analyzed_text_term_leaf(f, schema)),
+        _ => false,
+    }
 }
 
 /// The first field in `q` that the mapping has made completely unsearchable.
