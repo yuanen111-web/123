@@ -190,3 +190,8 @@ __pycache__/
 # in site generation or in any CI gate, and its only output was
 # .dogfood/seo/evidence/, so it follows the captures out of the tree.
 scripts/seo/evidence/
+
+# Local cargo xtask pinned tools and validation receipts
+.tools/
+engine/.tools/
+

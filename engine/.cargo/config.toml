@@ -42,3 +42,7 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = []
+
+[alias]
+xtask = "run -q -p xtask --"
+

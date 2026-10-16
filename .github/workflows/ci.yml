@@ -207,6 +207,27 @@ jobs:
       - name: Every workflow job declares a bounded timeout-minutes
         run: python3 .github/scripts/workflow-timeout-guard.py
 
+  xwork:
+    name: Projectfile + xtask verification (lsc)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: engine
+
+      - name: Run lowered xtask xwork pipeline
+        working-directory: engine
+        run: cargo xtask xwork
+
   # #474: the rc.18 release PR (#460) shipped three note-vs-tree contradictions
   # with the branch 16/16 green every time - a fix credited with more than it
   # did (#361), ROADMAP.md contradicting the CHANGELOG in the same commit, and

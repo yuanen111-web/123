@@ -19,6 +19,7 @@ members = [
     "crates/xerj-console-api",
     "crates/xerj-autoindex",
     "crates/xerj-hub",
+    "crates/xtask",
     "tests/es-compat-yaml",
 ]
 
@@ -157,6 +158,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # merge stopped resolving). One pin, one version. Per-crate grammar pins stay
 # local; the `workspace-resolves` CI gate catches any links crate that drifts.
 tree-sitter = "0.26"
+# Projectfile v1 + LeanSpec zero-I/O lowering engine and receipt contracts
+lsc-core = { git = "https://github.com/unsigned-gg/lsc.git", rev = "8a6c8ac" }
+serde_yaml = "0.9"
+
 
 [profile.release]
 opt-level = 3

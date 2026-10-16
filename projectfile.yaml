@@ -1,0 +1,117 @@
+$schema: https://projectfile.org/schema/v1.json
+kind: SoftwareSourceCode
+
+identity:
+  namespace: org.xerj
+  name: xerj
+  version: "1.0.0-rc.95"
+  title:
+    en: "XERJ"
+  summary:
+    en: "High-performance hybrid full-text, vector, log, and code search engine with neural embeddings and agent memory."
+  created: "2026-08-01"
+  modified: "2026-10-13"
+
+repositories:
+  - url: "https://github.com/xerj-org/xerj.git"
+    type: git
+    branch: main
+    role: origin
+
+links:
+  - type: source-code
+    url: https://github.com/xerj-org/xerj
+  - type: bugs
+    url: https://github.com/xerj-org/xerj/issues
+
+license:
+  spdx: Apache-2.0
+  file: LICENSE
+
+copyright:
+  year: 2026
+
+organizations:
+  - name: "XERJ"
+    url: https://github.com/xerj-org
+    roles: [funder, copyright]
+
+keywords:
+  - xerj
+  - search-engine
+  - vector-search
+  - bm25
+  - tree-sitter
+  - mcp
+  - rust
+
+technologies:
+  - rust
+  - tokio
+  - axum
+  - tonic
+  - roaring
+  - tree-sitter
+
+requirements:
+  runtime:
+    rust: ">=1.85"
+
+org:
+  projectfile:
+    operating-system: [ linux, macos, windows ]
+    architecture: [ amd64, arm64 ]
+    health:
+      endpoints:
+        - path: /_cluster/health
+          port: 9200
+          protocol: http
+          kind: readiness
+    ci:
+      # Stage order is the DAG order: a node runs after every node it needs. Tools inside one
+      # node run in name order, so a stage that must come earlier gets its own node.
+      nodes:
+        toolchain:
+          needs:
+            toolchain-check: true
+        hygiene:
+          needs:
+            toolchain: true
+            projectfile-check: true
+            stages-check: true
+            workflow-timeout-check: true
+        formatted:
+          needs:
+            hygiene: true
+            cargo-fmt: true
+        linted:
+          needs:
+            formatted: true
+            xtask-clippy: true
+        check:
+          goal: true
+          needs:
+            linted: true
+            xtask-test: true
+
+gg:
+  unsigned:
+    ls:
+      tools:
+        deny:
+          crate: cargo-deny
+          version: "0.19.9"
+          bin: cargo-deny
+        machete:
+          crate: cargo-machete
+          version: "0.9.1"
+          bin: cargo-machete
+        nextest:
+          crate: cargo-nextest
+          version: "0.9.104"
+          bin: cargo-nextest
+        typos:
+          crate: typos-cli
+          version: "1.49.0"
+          bin: typos
+
