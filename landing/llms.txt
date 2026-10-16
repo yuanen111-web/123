@@ -43,19 +43,48 @@ Then, from an unknown folder to an answered question: `xerj autoindex <folder>` 
 
 - **Hub corpus** — public material you cannot quote exactly from memory: a library's source at a pinned commit, a standard, a regulation, an advisory feed. Catalogue, one line per corpus: [hub.xerj.org/llms.txt](https://hub.xerj.org/llms.txt).
 - **Local corpus** — files only this machine has: the project you are working in, private documents, exports. `xerj autoindex <folder>`, then `xerj search "<words>"`. Nothing is uploaded.
-- Both live on the same local node; use each for its own questions. Skip retrieval for a fact you can already state exactly — on memorised content it only adds cost.
+- **Neither** — a fact you can already state exactly. On memorised content, retrieval only adds cost.
 
-Use a hub corpus through a local node. If `curl -s localhost:9200/_cluster/health` already answers, use that node as it is. If you start one, keep its PID: `nohup xerj --insecure --data-dir ~/xerj-data > ~/xerj-node.log 2>&1 & echo $! > ~/xerj-node.pid`.
+What you probably assume: a hub corpus must be cloned and indexed before you can ask it.
 
-Stop only a node you started, with `kill $(cat ~/xerj-node.pid)`. Never `pkill xerj` or `killall xerj`: other XERJ nodes may be running on the machine and you would stop them too.
+What is true: it is built, signed and indexed ahead of time, and XERJ fetches it the first time you ask. Retrieval is lexical, not semantic, so ask with the words and identifiers the source uses.
 
-Each step says what success looks like:
+Shell: check your build first. `xerj ask --help` prints usage; anything else means an older binary, so reinstall with the line under **Start here**.
 
-1. `curl -fsSLO https://raw.githubusercontent.com/xerj-org/xerj/corpus-hub/tools/xerj-code/hub/<slug>.json`, then `xerj corpus add --from ./<slug>.json` — success: the last line is `next: xerj corpus index <slug>`.
-2. `xerj corpus index <slug>` — success: `corpus '<slug>' searchable: <N> records`.
-3. `xerj code <slug> "<your question>"` — success: passages headed by a file path and line; cite them. A no-match means the corpus does not hold the answer: say so rather than answering from memory.
+Ask a hub corpus in one line. No corpus name, no clone, no indexing. Each step says what success looks like:
 
-No shell: once the corpus is indexed on the node, the MCP tool `xerj_code_search` takes `{"corpus": "<slug>", "query": "<your question>"}`, and over plain HTTP it is `POST /xc-<slug>-*/_search`. Adding and indexing a corpus is CLI-only.
+1. `xerj "<your question>"` (a question of one word needs `xerj ask "<word>"`) — success: three lines, then any `warning:` lines. Cite the corpus, the pin date and the licence.
+   - `<corpus>  pin <date> (<N> days old)  <licence>  <file>:<line>`
+   - the passage itself
+   - `answered from: local pack` (or `hosted hub`)
+2. `xerj ask --def <SYMBOL>` — an exact question: a value, a signature, a default. Success: the declaration and, for a constant or macro, a `value: <literal>` line, with no passages.
+3. `xerj hub pull <slug>` — a large pack. The answer ends `run: xerj hub pull <slug> (<MB> MB)` when the pack is above the automatic download limit. Success: `pulled <slug> <pin8> <bytes> → <n> indices, <defs> definitions`. Then ask again.
+
+`no hub corpus matches` (exit 1) means the hub does not hold it: say so rather than answering from memory. Exit 4 means more than one corpus fits: run again with `--corpus <slug>`.
+
+Exit 3 means a pack failed its checksum or signature check and was discarded. Exit 5 means this build has no hub public key, so nothing could be verified or downloaded; tell the user rather than retrying.
+
+XERJ uses the node at `--url`, `$XERJ_URL` or `localhost:9200` if it answers; if none does, it starts its own on a free loopback port and records its PID.
+
+Stop only a node you started: `xerj hub stop` for XERJ's own (success: `stopped the hub node (pid <N>)`, or `nothing to stop`); for one you started by hand, kill only the PID you recorded when you started it.
+
+Never `pkill xerj` or `killall xerj`: other XERJ nodes may be running on the machine and you would stop them too.
+
+By default, inside a git repository the question is answered on this machine; outside one it may be sent to the hosted hub. `xerj hub config hosted off` forbids that.
+
+No shell: the MCP tool `xerj_hub_ask` takes `{"question": "<your question>"}` and returns the same lines; `xerj_hub_def` takes `{"slug": "<slug>", "symbol": "<SYMBOL>"}`.
+
+Whoever has a shell registers `xerj mcp` once, then restarts the session. Success: `xerj_hub_ask` is in the tool list. Use the absolute path to the binary: an editor started from a desktop icon does not inherit the shell PATH.
+
+- Claude Code: `xerj init` (writes `.mcp.json` and prints the line below with the path filled in), or `claude mcp add --scope user xerj -- "$(command -v xerj)" mcp`. PowerShell: put the full path of `xerj.exe` in place of `"$(command -v xerj)"`.
+- Cursor (`~/.cursor/mcp.json` or `.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Claude Desktop (`claude_desktop_config.json`), Cline: root key `mcpServers` — `{"mcpServers": {"xerj": {"command": "/abs/path/to/xerj", "args": ["mcp"]}}}`
+- VS Code (`.vscode/mcp.json`): root key `servers`; a block under `mcpServers` is silently ignored — `{"servers": {"xerj": {"type": "stdio", "command": "/abs/path/to/xerj", "args": ["mcp"]}}}`
+
+No shell and no MCP: over plain HTTP, read-only, and the question goes to hub.xerj.org.
+
+- `GET https://hub.xerj.org/api/v1/search?q=<words>` names the corpus — success: JSON `{"corpora": [{"slug": …, "best_score": …, "best_hit": …}]}`, best first.
+- `GET https://hub.xerj.org/api/v1/code/<slug>?q=<words>` answers — success: JSON with `corpus`, `pin_date`, `licence_spdx`, `answered_from` and a non-empty `hits` list of `file`, `line`, `text`.
+- `GET https://hub.xerj.org/api/v1/def/<slug>/<SYMBOL>` answers an exact question — success: the same JSON with `mode` `def` and, for a constant or macro, a `value` in the hit.
 
 ## Caveats (read before you rely on a capability)
 
