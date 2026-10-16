@@ -750,6 +750,11 @@ pub struct Engine {
     /// `ShardRouter::update_from_metadata` whenever the Raft log
     /// commits a new shard assignment.
     pub shard_router: Arc<parking_lot::RwLock<xerj_cluster::router::ShardRouter>>,
+    /// Live Raft cluster handle when clustering is attached (#1170).
+    pub cluster_handle: Arc<parking_lot::RwLock<Option<xerj_cluster::ClusterHandle>>>,
+    /// Non-zero while `EngineClusterApplier` is applying a committed Raft log entry
+    /// so replicated mutations are not re-proposed to Raft (#1170).
+    pub cluster_apply_depth: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Exclusive advisory lock on `<data_dir>/node.lock`, held for the
     /// engine's whole lifetime (RC4 blocker 13). Acquired in
@@ -809,6 +814,53 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Attach a [`xerj_cluster::ClusterNode`] to this engine (#1170).
+    ///
+    /// Registers an [`EngineClusterApplier`] on `node` so committed Raft log
+    /// entries are applied to local indices and shard routing metadata, and
+    /// stores a [`xerj_cluster::ClusterHandle`] on the engine and all open
+    /// indices so local index/mapping/document mutations are replicated across
+    /// the Raft ring.
+    pub fn attach_cluster(&self, node: &mut xerj_cluster::ClusterNode) {
+        let handle = node.handle();
+        *self.cluster_handle.write() = Some(handle.clone());
+        for entry in self.indices.iter() {
+            entry.value().set_cluster_state(Some((
+                handle.clone(),
+                Arc::clone(&self.cluster_apply_depth),
+            )));
+        }
+        node.set_applier(Arc::new(EngineClusterApplier {
+            engine: self.clone(),
+            apply_depth: Arc::clone(&self.cluster_apply_depth),
+        }));
+    }
+
+    /// Return a live snapshot of the attached Raft node's state, if any (#1170).
+    pub fn cluster_status(&self) -> Option<xerj_cluster::ClusterStatusSnapshot> {
+        self.cluster_handle
+            .read()
+            .as_ref()
+            .map(|h| h.status_snapshot())
+    }
+
+    fn active_cluster_handle(&self) -> Option<xerj_cluster::ClusterHandle> {
+        if self
+            .cluster_apply_depth
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            return None;
+        }
+        self.cluster_handle.read().clone()
+    }
+
+    fn bind_index_cluster_state(&self, idx: &Index) {
+        if let Some(handle) = self.cluster_handle.read().clone() {
+            idx.set_cluster_state(Some((handle, Arc::clone(&self.cluster_apply_depth))));
+        }
+    }
+
     pub fn segment_hydration_cache_capacities(
         &self,
     ) -> [usize; crate::segment_cache_budget::CATEGORY_COUNT] {
@@ -955,6 +1007,8 @@ impl Engine {
             shard_router: Arc::new(parking_lot::RwLock::new(
                 xerj_cluster::router::ShardRouter::new(1),
             )),
+            cluster_handle: Arc::new(parking_lot::RwLock::new(None)),
+            cluster_apply_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
             cluster_state_boot: Arc::new(cluster_state_status),
@@ -1016,6 +1070,7 @@ impl Engine {
                                 Engine::apply_date_mapping_flags(&idx, m.value());
                             }
                             engine.load_or_backfill_index_created_at(&name_str);
+                            engine.bind_index_cluster_state(&idx);
                             engine.indices.insert(name_str, idx);
                         }
                         Err(e) => {
@@ -1424,6 +1479,13 @@ impl Engine {
 
         // Apply matching template (highest priority wins) on every create path.
         let effective_schema = self.apply_index_template(name, schema);
+        let cluster_schema_json = self.active_cluster_handle().and_then(|_| {
+            serde_json::to_string(&serde_json::json!({
+                "schema": &effective_schema,
+                "settings": &settings,
+            }))
+            .ok()
+        });
         let idx = Index::create_with_settings(
             index_name,
             effective_schema,
@@ -1436,8 +1498,17 @@ impl Engine {
         // is published, so no ingest (and therefore no prune) can run against
         // the wrong floor.
         idx.set_wal_min_retained_generations(self.wal_retention_floor());
+        self.bind_index_cluster_state(&idx);
         self.indices.insert(name.to_string(), idx);
         self.record_index_created_at(name);
+        if let (Some(handle), Some(schema_json)) =
+            (self.active_cluster_handle(), cluster_schema_json)
+        {
+            handle.submit_preapplied(xerj_cluster::ClusterCommand::CreateIndex {
+                name: name.to_string(),
+                schema_json,
+            });
+        }
         info!(name, "index created with custom settings");
         Ok(())
     }
@@ -1466,8 +1537,19 @@ impl Engine {
                 }
             }
         }
+        let cluster_mapping_json = self
+            .active_cluster_handle()
+            .and_then(|_| serde_json::to_string(&mapping).ok());
         self.propagate_date_detection(name, &mapping);
         self.index_mappings.insert(name.to_string(), mapping);
+        if let (Some(handle), Some(mapping_json)) =
+            (self.active_cluster_handle(), cluster_mapping_json)
+        {
+            handle.submit_preapplied(xerj_cluster::ClusterCommand::UpdateMapping {
+                index: name.to_string(),
+                mapping_json,
+            });
+        }
         Ok(())
     }
 
@@ -3075,6 +3157,16 @@ impl Engine {
         }
 
         self.forget_index_metadata(name);
+        if let Some(handle) = self.active_cluster_handle() {
+            let _ = handle
+                .replicate_preapplied(
+                    xerj_cluster::ClusterCommand::DeleteIndex {
+                        name: name.to_string(),
+                    },
+                    std::time::Duration::from_millis(250),
+                )
+                .await;
+        }
         info!(name, "index deleted");
         Ok(())
     }
@@ -3231,6 +3323,7 @@ impl Engine {
                 if let Some(m) = self.index_mappings.get(name) {
                     Engine::apply_date_mapping_flags(&idx, m.value());
                 }
+                self.bind_index_cluster_state(&idx);
                 self.indices.insert(name.to_string(), idx);
                 self.failed_indices.remove(name);
                 info!(name, "failed index reopened");
@@ -4609,6 +4702,7 @@ impl Engine {
                     if let Some(m) = self.index_mappings.get(idx_name) {
                         Engine::apply_date_mapping_flags(&idx, m.value());
                     }
+                    self.bind_index_cluster_state(&idx);
                     self.indices.insert(idx_name.clone(), idx);
                     // Restoring from a snapshot is *the* repair for an index
                     // that failed to open, so clear the recorded failure —
@@ -4827,6 +4921,135 @@ fn es_type_to_field_type(es_type: &str) -> xerj_common::types::FieldType {
         "binary" => FieldType::Binary,
         "nested" => FieldType::Nested,
         _ => FieldType::Object,
+    }
+}
+
+struct ClusterApplyGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> ClusterApplyGuard<'a> {
+    fn new(depth: &'a std::sync::atomic::AtomicUsize) -> Self {
+        depth.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(depth)
+    }
+}
+
+impl Drop for ClusterApplyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+struct EngineClusterApplier {
+    engine: Engine,
+    apply_depth: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl xerj_cluster::ClusterApplier for EngineClusterApplier {
+    async fn apply_committed(
+        &self,
+        entry: &xerj_cluster::LogEntry,
+        metadata: &xerj_cluster::ClusterMetadata,
+    ) {
+        let engine = &self.engine;
+        let _guard = ClusterApplyGuard::new(&self.apply_depth);
+
+        match &entry.command {
+            xerj_cluster::ClusterCommand::CreateIndex { name, schema_json } => {
+                if !engine.indices.contains_key(name) {
+                    let (schema, settings) = serde_json::from_str::<serde_json::Value>(schema_json)
+                        .ok()
+                        .and_then(|v| {
+                            if v.get("schema").is_some() {
+                                let s: Schema =
+                                    serde_json::from_value(v.get("schema")?.clone()).ok()?;
+                                let settings = v
+                                    .get("settings")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!({}));
+                                Some((s, settings))
+                            } else {
+                                let s: Schema = serde_json::from_value(v).ok()?;
+                                Some((s, serde_json::json!({})))
+                            }
+                        })
+                        .unwrap_or_else(|| (Schema::default(), serde_json::json!({})));
+                    let _ = engine.create_index_with_settings(name, schema, settings);
+                }
+            }
+            xerj_cluster::ClusterCommand::DeleteIndex { name } => {
+                if engine.indices.contains_key(name) || engine.failed_indices.contains_key(name) {
+                    let _ = engine.delete_index(name).await;
+                }
+            }
+            xerj_cluster::ClusterCommand::UpdateMapping {
+                index,
+                mapping_json,
+            } => {
+                if let Ok(mapping) = serde_json::from_str::<serde_json::Value>(mapping_json) {
+                    let _ = engine.put_index_mapping(index, mapping);
+                }
+            }
+            xerj_cluster::ClusterCommand::IndexDocument {
+                index,
+                doc_id,
+                source_json,
+            } => {
+                if !engine.indices.contains_key(index) {
+                    let _ = engine.create_index_with_settings(
+                        index,
+                        Schema::default(),
+                        serde_json::json!({}),
+                    );
+                }
+                if let (Ok(idx), Ok(source)) = (
+                    engine.get_index(index),
+                    serde_json::from_str::<serde_json::Value>(source_json),
+                ) {
+                    let _ = idx.index_document(Some(doc_id.clone()), source).await;
+                }
+            }
+            xerj_cluster::ClusterCommand::BulkIndexDocuments { index, docs } => {
+                if !engine.indices.contains_key(index) {
+                    let _ = engine.create_index_with_settings(
+                        index,
+                        Schema::default(),
+                        serde_json::json!({}),
+                    );
+                }
+                if let Ok(idx) = engine.get_index(index) {
+                    let parsed: Vec<(String, serde_json::Value)> = docs
+                        .iter()
+                        .filter_map(|(id, src)| {
+                            serde_json::from_str::<serde_json::Value>(src)
+                                .ok()
+                                .map(|v| (id.clone(), v))
+                        })
+                        .collect();
+                    if !parsed.is_empty() {
+                        let _ = idx.index_batch_turbo(parsed, false, false).await;
+                    }
+                }
+            }
+            xerj_cluster::ClusterCommand::DeleteDocument { index, doc_id } => {
+                if let Ok(idx) = engine.get_index(index) {
+                    let _ = idx.delete_document(doc_id).await;
+                }
+            }
+            xerj_cluster::ClusterCommand::AssignShard { .. }
+            | xerj_cluster::ClusterCommand::AddNode { .. }
+            | xerj_cluster::ClusterCommand::RemoveNode { .. }
+            | xerj_cluster::ClusterCommand::UpdateConfig { .. } => {}
+        }
+
+        engine.shard_router.write().update_from_metadata(metadata);
+    }
+
+    fn sync_metadata(&self, metadata: &xerj_cluster::ClusterMetadata) {
+        self.engine
+            .shard_router
+            .write()
+            .update_from_metadata(metadata);
     }
 }
 

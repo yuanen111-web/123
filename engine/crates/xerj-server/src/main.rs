@@ -2631,7 +2631,8 @@ async fn async_main() -> Result<()> {
                     .filter(|id| id != &node_id)
                     .collect();
 
-                let node = ClusterNode::new(node_id.clone(), peer_ids, Box::new(transport));
+                let mut node = ClusterNode::new(node_id.clone(), peer_ids, Box::new(transport));
+                engine.attach_cluster(&mut node);
                 let mut runner = ClusterRunner::new(node, tick, shutdown_rx);
 
                 info!(node = %node_id, "Starting cluster runner (Raft mode)");

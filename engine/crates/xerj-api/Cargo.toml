@@ -70,6 +70,8 @@ rand         = { workspace = true }
 sha2         = "0.10"
 
 [dev-dependencies]
+xerj-cluster = { path = "../xerj-cluster" }
 tempfile     = { workspace = true }
 tower        = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+

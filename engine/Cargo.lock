@@ -7355,6 +7355,7 @@ dependencies = [
  "uuid",
  "xerj-ai",
  "xerj-autoindex",
+ "xerj-cluster",
  "xerj-common",
  "xerj-engine",
  "xerj-hub",
@@ -7543,6 +7544,7 @@ version = "1.0.0-rc.95"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "async-trait",
  "bytes",
  "chrono",
  "chrono-tz",

@@ -49,6 +49,11 @@ fi
 
 cd "$REPO_ROOT/engine"
 
+# engine/fuzz is an excluded sub-workspace whose Cargo.lock is gitignored.
+# Seed it from the tracked workspace lockfile so cargo-fuzz reuses pinned
+# transitive versions instead of resolving yanked crates from scratch.
+cp -f "$REPO_ROOT/engine/Cargo.lock" "$FUZZ_DIR/Cargo.lock"
+
 echo "==> building fuzz targets (ASan + libFuzzer)"
 cargo +nightly fuzz build
 

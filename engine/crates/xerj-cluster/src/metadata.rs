@@ -140,6 +140,12 @@ impl ClusterMetadata {
             ClusterCommand::UpdateConfig { key, value } => {
                 self.apply_update_config(key, value);
             }
+            ClusterCommand::IndexDocument { .. }
+            | ClusterCommand::BulkIndexDocuments { .. }
+            | ClusterCommand::DeleteDocument { .. } => {
+                // Document writes and deletes are applied by the attached
+                // ClusterApplier (Engine); metadata still advances last_applied_index.
+            }
         }
 
         self.last_applied_index = log_index;

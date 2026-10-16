@@ -19,6 +19,7 @@ xerj-wasm    = { path = "../xerj-wasm" }
 xerj-cluster = { path = "../xerj-cluster" }
 
 tokio      = { workspace = true }
+async-trait = "0.1"
 # `join_all` for the hybrid legs (#939). Already in the lockfile via the
 # workspace's `futures`; no new crate is pulled in.
 futures-util = "0.3"

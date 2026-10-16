@@ -8,14 +8,17 @@
 //! In production, the transport will be a gRPC/QUIC channel. In tests, an
 //! in-memory channel is used (see [`transport`] module).
 
+use std::collections::VecDeque;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::metadata::ClusterMetadata;
-use crate::raft::{ClusterCommand, OutboundMessage, RaftMessage, RaftNode, RaftState};
+use crate::raft::{ClusterCommand, LogEntry, OutboundMessage, RaftMessage, RaftNode, RaftState};
 
 // ── Transport abstraction ─────────────────────────────────────────────────────
 
@@ -32,25 +35,197 @@ pub trait ClusterTransport: Send + Sync {
     async fn recv(&self) -> Result<(String, RaftMessage)>;
 }
 
+// ── Engine / State-Machine Applier & Handle ──────────────────────────────────
+
+/// Callback hook invoked by [`ClusterNode`] whenever a [`LogEntry`] is committed
+/// by Raft and applied to [`ClusterMetadata`].
+///
+/// The storage engine implements this trait so that committed index DDL
+/// (`CreateIndex`, `DeleteIndex`, `UpdateMapping`) and document DML
+/// (`IndexDocument`, `BulkIndexDocuments`, `DeleteDocument`) replicate onto
+/// every node's local [`Engine`] instance.
+#[async_trait]
+pub trait ClusterApplier: Send + Sync {
+    /// Apply a newly committed [`LogEntry`] to the local storage engine.
+    async fn apply_committed(&self, entry: &LogEntry, metadata: &ClusterMetadata);
+
+    /// Synchronise any cluster-wide metadata snapshots after applying an entry.
+    fn sync_metadata(&self, _metadata: &ClusterMetadata) {}
+}
+
+/// Thread-safe snapshot of a node's live Raft state and replicated [`ClusterMetadata`].
+#[derive(Debug, Clone)]
+pub struct ClusterStatusSnapshot {
+    pub node_id: String,
+    pub state: RaftState,
+    pub current_term: u64,
+    pub leader_id: Option<String>,
+    pub commit_index: u64,
+    pub last_applied: u64,
+    pub peers: Vec<String>,
+    pub metadata: ClusterMetadata,
+}
+
+struct ClusterProposalRequest {
+    command: ClusterCommand,
+    /// When `true`, the local engine already applied the mutation before
+    /// submitting the Raft command, so `apply_committed` is skipped once on
+    /// this node when the command commits.
+    preapplied: bool,
+    commit_tx: Option<oneshot::Sender<Result<u64>>>,
+}
+
+/// Cloneable handle to a running [`ClusterNode`].
+///
+/// Allows the storage engine and HTTP handlers to read live Raft status
+/// (`leader_id`, `state`, `current_term`, `commit_index`, `metadata`) and
+/// submit [`ClusterCommand`] proposals from both synchronous and asynchronous
+/// call sites without holding a mutable borrow of [`ClusterNode`].
+#[derive(Clone)]
+pub struct ClusterHandle {
+    status: Arc<RwLock<ClusterStatusSnapshot>>,
+    cmd_tx: mpsc::UnboundedSender<ClusterProposalRequest>,
+}
+
+impl std::fmt::Debug for ClusterHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snap = self.status_snapshot();
+        f.debug_struct("ClusterHandle")
+            .field("node_id", &snap.node_id)
+            .field("state", &snap.state)
+            .field("current_term", &snap.current_term)
+            .field("leader_id", &snap.leader_id)
+            .field("commit_index", &snap.commit_index)
+            .finish()
+    }
+}
+
+impl ClusterHandle {
+    /// Read the most recent [`ClusterStatusSnapshot`] published by the [`ClusterNode`].
+    pub fn status_snapshot(&self) -> ClusterStatusSnapshot {
+        self.status
+            .read()
+            .expect("ClusterStatusSnapshot RwLock poisoned")
+            .clone()
+    }
+
+    /// Enqueue a [`ClusterCommand`] whose local side-effects have already been
+    /// applied on this node. Non-blocking; safe to call from synchronous code.
+    pub fn submit_preapplied(&self, command: ClusterCommand) {
+        let _ = self.cmd_tx.send(ClusterProposalRequest {
+            command,
+            preapplied: true,
+            commit_tx: None,
+        });
+    }
+
+    /// Enqueue a [`ClusterCommand`] whose local side-effects have already been
+    /// applied on this node, and wait up to `timeout` for Raft commit.
+    ///
+    /// If the cluster has no active runner or cannot reach quorum within
+    /// `timeout` (for example in a degraded partition), returns `Err` after
+    /// `timeout` while the proposal remains queued in Raft.
+    pub async fn replicate_preapplied(
+        &self,
+        command: ClusterCommand,
+        timeout: Duration,
+    ) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ClusterProposalRequest {
+                command,
+                preapplied: true,
+                commit_tx: Some(tx),
+            })
+            .map_err(|_| anyhow::anyhow!("cluster node channel closed"))?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(anyhow::anyhow!("cluster proposal waiter dropped")),
+            Err(_) => Err(anyhow::anyhow!("timed out waiting for Raft commit")),
+        }
+    }
+
+    /// Submit a [`ClusterCommand`] through Raft without pre-applying locally
+    /// (so all nodes, including the proposer, invoke [`ClusterApplier::apply_committed`]
+    /// once committed) and wait up to `timeout` for commit.
+    pub async fn propose(&self, command: ClusterCommand, timeout: Duration) -> Result<u64> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ClusterProposalRequest {
+                command,
+                preapplied: false,
+                commit_tx: Some(tx),
+            })
+            .map_err(|_| anyhow::anyhow!("cluster node channel closed"))?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(anyhow::anyhow!("cluster proposal waiter dropped")),
+            Err(_) => Err(anyhow::anyhow!("timed out waiting for Raft commit")),
+        }
+    }
+}
+
 // ── Cluster node ──────────────────────────────────────────────────────────────
 
 /// A running cluster node.
 ///
 /// Drives the Raft state machine forward via periodic ticks and delivers
-/// committed log entries to the local [`ClusterMetadata`] state machine.
+/// committed log entries to the local [`ClusterMetadata`] state machine and
+/// optional [`ClusterApplier`].
 pub struct ClusterNode {
     pub raft: RaftNode,
     pub metadata: ClusterMetadata,
     transport: Box<dyn ClusterTransport>,
+    status: Arc<RwLock<ClusterStatusSnapshot>>,
+    cmd_tx: mpsc::UnboundedSender<ClusterProposalRequest>,
+    cmd_rx: mpsc::UnboundedReceiver<ClusterProposalRequest>,
+    applier: Option<Arc<dyn ClusterApplier>>,
+    preapplied_commands: VecDeque<(ClusterCommand, Option<oneshot::Sender<Result<u64>>>)>,
+    commit_waiters: VecDeque<(ClusterCommand, oneshot::Sender<Result<u64>>)>,
+    pending_proposals: VecDeque<ClusterProposalRequest>,
 }
 
 impl ClusterNode {
     /// Create a new cluster node with the given identity, peers, and transport.
     pub fn new(id: String, peers: Vec<String>, transport: Box<dyn ClusterTransport>) -> Self {
+        let raft = RaftNode::new(id, peers);
+        let metadata = ClusterMetadata::new();
+        let status = Arc::new(RwLock::new(ClusterStatusSnapshot {
+            node_id: raft.id.clone(),
+            state: raft.state().clone(),
+            current_term: raft.current_term(),
+            leader_id: raft.leader_id().map(|s| s.to_string()),
+            commit_index: raft.commit_index(),
+            last_applied: raft.last_applied(),
+            peers: raft.peers().to_vec(),
+            metadata: metadata.clone(),
+        }));
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         ClusterNode {
-            raft: RaftNode::new(id, peers),
-            metadata: ClusterMetadata::new(),
+            raft,
+            metadata,
             transport,
+            status,
+            cmd_tx,
+            cmd_rx,
+            applier: None,
+            preapplied_commands: VecDeque::new(),
+            commit_waiters: VecDeque::new(),
+            pending_proposals: VecDeque::new(),
+        }
+    }
+
+    /// Attach a [`ClusterApplier`] (such as [`xerj_engine::Engine`]) that will
+    /// receive every committed [`LogEntry`].
+    pub fn set_applier(&mut self, applier: Arc<dyn ClusterApplier>) {
+        self.applier = Some(applier);
+    }
+
+    /// Return a cloneable [`ClusterHandle`] connected to this node.
+    pub fn handle(&self) -> ClusterHandle {
+        ClusterHandle {
+            status: Arc::clone(&self.status),
+            cmd_tx: self.cmd_tx.clone(),
         }
     }
 
@@ -60,17 +235,24 @@ impl ClusterNode {
     pub async fn tick(&mut self) -> Result<()> {
         let msgs = self.raft.tick();
         self.dispatch(msgs).await?;
-        self.apply_ready();
+        self.drain_pending_proposals().await?;
+        self.apply_ready().await;
         Ok(())
     }
 
     /// Process a single inbound message from a peer.
     pub async fn handle_message(&mut self, from: &str, msg: RaftMessage) -> Result<()> {
         debug!(node = %self.raft.id, %from, "Handling inbound Raft message");
-        let _ = from; // currently unused directly — sender is embedded in message
+        let _ = from; // sender is embedded in message variants that need it
+        let prev_commit = self.raft.commit_index();
         let replies = self.raft.handle_message(msg);
         self.dispatch(replies).await?;
-        self.apply_ready();
+        if self.raft.is_leader() && self.raft.commit_index() > prev_commit {
+            let commit_hb = self.raft.force_heartbeat();
+            self.dispatch(commit_hb).await?;
+        }
+        self.drain_pending_proposals().await?;
+        self.apply_ready().await;
         Ok(())
     }
 
@@ -79,32 +261,35 @@ impl ClusterNode {
     /// After calling this, the entry will be replicated and, once committed,
     /// automatically applied to the local [`ClusterMetadata`] via the run loop.
     pub fn propose(&mut self, cmd: ClusterCommand) -> Result<u64> {
-        self.raft.propose(cmd)
+        let res = self.raft.propose(cmd);
+        self.update_status();
+        res
     }
 
     /// Perform one iteration of the node event loop:
-    /// 1. Wait for an inbound message, bounded by `tick_interval`.
-    /// 2. If one arrives, deliver it to the Raft state machine.
+    /// 1. Drain any ready outbound proposals from [`ClusterHandle`].
+    /// 2. Wait for an inbound peer message or a new proposal, bounded by `tick_interval`.
     /// 3. Tick the state machine (advancing elections / heartbeats).
-    ///
-    /// This is the unit of work that [`crate::runner::ClusterRunner`] drives,
-    /// so the caller can interleave it with a shutdown signal via
-    /// `tokio::select!`. It is cancellation-safe: dropping the returned future
-    /// before it resolves only abandons an in-flight `recv`/`send`, which Raft
-    /// tolerates via retransmission.
     pub async fn step(&mut self, tick_interval: Duration) -> Result<()> {
-        // Try to receive a message within the tick interval.
-        let recv_result = tokio::time::timeout(tick_interval, self.transport.recv()).await;
+        self.drain_pending_proposals().await?;
 
-        match recv_result {
-            Ok(Ok((from, msg))) => {
-                self.handle_message(&from, msg).await?;
+        tokio::select! {
+            recv_result = tokio::time::timeout(tick_interval, self.transport.recv()) => {
+                match recv_result {
+                    Ok(Ok((from, msg))) => {
+                        self.handle_message(&from, msg).await?;
+                    }
+                    Ok(Err(e)) => {
+                        warn!(node = %self.raft.id, error = %e, "Transport recv error");
+                    }
+                    Err(_timeout) => {
+                        // Timeout is normal — proceed to tick.
+                    }
+                }
             }
-            Ok(Err(e)) => {
-                warn!(node = %self.raft.id, error = %e, "Transport recv error");
-            }
-            Err(_timeout) => {
-                // Timeout is normal — just tick.
+            Some(req) = self.cmd_rx.recv() => {
+                self.pending_proposals.push_back(req);
+                self.drain_pending_proposals().await?;
             }
         }
 
@@ -113,13 +298,6 @@ impl ClusterNode {
     }
 
     /// Run the node event loop forever (until an error is hit).
-    ///
-    /// Each iteration is a single [`ClusterNode::step`]: waits for an inbound
-    /// message (with a timeout equal to the tick interval), delivers it to the
-    /// Raft state machine, then ticks.
-    ///
-    /// In production you would wrap this with a `tokio::select!` that listens
-    /// for a shutdown signal — see [`crate::runner::ClusterRunner::run`].
     pub async fn run(&mut self, tick_interval: Duration) -> Result<()> {
         info!(node = %self.raft.id, "Starting cluster node run loop");
         loop {
@@ -144,6 +322,67 @@ impl ClusterNode {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    fn update_status(&self) {
+        if let Ok(mut guard) = self.status.write() {
+            *guard = ClusterStatusSnapshot {
+                node_id: self.raft.id.clone(),
+                state: self.raft.state().clone(),
+                current_term: self.raft.current_term(),
+                leader_id: self.raft.leader_id().map(|s| s.to_string()),
+                commit_index: self.raft.commit_index(),
+                last_applied: self.raft.last_applied(),
+                peers: self.raft.peers().to_vec(),
+                metadata: self.metadata.clone(),
+            };
+        }
+    }
+
+    async fn drain_pending_proposals(&mut self) -> Result<()> {
+        while let Ok(req) = self.cmd_rx.try_recv() {
+            self.pending_proposals.push_back(req);
+        }
+        if self.raft.is_leader() || self.raft.leader_id().is_some() {
+            while let Some(req) = self.pending_proposals.pop_front() {
+                self.process_proposal_request(req).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_proposal_request(&mut self, req: ClusterProposalRequest) -> Result<()> {
+        if !self.raft.is_leader() && self.raft.leader_id().is_none() {
+            self.pending_proposals.push_back(req);
+            return Ok(());
+        }
+
+        if req.preapplied {
+            self.preapplied_commands
+                .push_back((req.command.clone(), req.commit_tx));
+        } else if let Some(tx) = req.commit_tx {
+            self.commit_waiters.push_back((req.command.clone(), tx));
+        }
+
+        if self.raft.is_leader() {
+            if let Err(e) = self.raft.propose(req.command) {
+                warn!(node = %self.raft.id, error = %e, "Failed to propose command on leader");
+            } else {
+                let hb = self.raft.force_heartbeat();
+                self.dispatch(hb).await?;
+                self.apply_ready().await;
+            }
+        } else if let Some(leader) = self.raft.leader_id().map(|s| s.to_string()) {
+            self.dispatch(vec![OutboundMessage {
+                to: leader,
+                msg: RaftMessage::ForwardProposal {
+                    from: self.raft.id.clone(),
+                    command: req.command,
+                },
+            }])
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn dispatch(&self, msgs: Vec<OutboundMessage>) -> Result<()> {
         for out in msgs {
             if let Err(e) = self.transport.send(&out.to, out.msg).await {
@@ -160,17 +399,70 @@ impl ClusterNode {
     }
 
     /// Drain and apply all newly committed log entries.
-    fn apply_ready(&mut self) {
-        let entries = self.raft.ready();
-        for entry in entries {
-            debug!(
-                node = %self.raft.id,
-                index = entry.index,
-                term = entry.term,
-                "Applying committed entry"
-            );
-            self.metadata.apply(entry.index, &entry.command);
+    async fn apply_ready(&mut self) {
+        loop {
+            let entries = self.raft.ready();
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                debug!(
+                    node = %self.raft.id,
+                    index = entry.index,
+                    term = entry.term,
+                    "Applying committed entry"
+                );
+                self.metadata.apply(entry.index, &entry.command);
+
+                if let ClusterCommand::CreateIndex { ref name, .. } = entry.command {
+                    if self.raft.is_leader()
+                        && !self
+                            .metadata
+                            .shard_assignments
+                            .contains_key(&(name.clone(), 0))
+                        && self
+                            .raft
+                            .propose(ClusterCommand::AssignShard {
+                                index: name.clone(),
+                                shard: 0,
+                                node_id: self.raft.id.clone(),
+                            })
+                            .is_ok()
+                    {
+                        let hb = self.raft.force_heartbeat();
+                        let _ = self.dispatch(hb).await;
+                    }
+                }
+
+                if let Some(pos) = self
+                    .preapplied_commands
+                    .iter()
+                    .position(|(cmd, _)| cmd == &entry.command)
+                {
+                    let (_, commit_tx) = self.preapplied_commands.remove(pos).unwrap();
+                    if let Some(ref applier) = self.applier {
+                        applier.sync_metadata(&self.metadata);
+                    }
+                    if let Some(tx) = commit_tx {
+                        let _ = tx.send(Ok(entry.index));
+                    }
+                } else {
+                    if let Some(ref applier) = self.applier {
+                        applier.apply_committed(&entry, &self.metadata).await;
+                        applier.sync_metadata(&self.metadata);
+                    }
+                    if let Some(pos) = self
+                        .commit_waiters
+                        .iter()
+                        .position(|(cmd, _)| cmd == &entry.command)
+                    {
+                        let (_, tx) = self.commit_waiters.remove(pos).unwrap();
+                        let _ = tx.send(Ok(entry.index));
+                    }
+                }
+            }
         }
+        self.update_status();
     }
 }
 

@@ -72,6 +72,19 @@ pub enum ClusterCommand {
         key: String,
         value: String,
     },
+    IndexDocument {
+        index: String,
+        doc_id: String,
+        source_json: String,
+    },
+    BulkIndexDocuments {
+        index: String,
+        docs: Vec<(String, String)>,
+    },
+    DeleteDocument {
+        index: String,
+        doc_id: String,
+    },
 }
 
 /// A single entry in the Raft replicated log.
@@ -119,6 +132,11 @@ pub enum RaftMessage {
         from: String,
         term: u64,
         vote_granted: bool,
+    },
+    /// Follower → Leader: forward a client/engine command proposal to the Raft leader.
+    ForwardProposal {
+        from: String,
+        command: ClusterCommand,
     },
 }
 
@@ -284,6 +302,32 @@ impl RaftNode {
     pub fn handle_message(&mut self, msg: RaftMessage) -> Vec<OutboundMessage> {
         let mut out = Vec::new();
 
+        if let RaftMessage::ForwardProposal { from, command } = msg {
+            if self.state == RaftState::Leader {
+                match self.propose(command) {
+                    Ok(_idx) => {
+                        out.extend(self.send_heartbeats());
+                    }
+                    Err(e) => {
+                        warn!(
+                            node = %self.id,
+                            %from,
+                            error = %e,
+                            "Failed to propose forwarded command"
+                        );
+                    }
+                }
+            } else if let Some(leader) = self.leader_id.clone() {
+                if leader != self.id && leader != from {
+                    out.push(OutboundMessage {
+                        to: leader,
+                        msg: RaftMessage::ForwardProposal { from, command },
+                    });
+                }
+            }
+            return out;
+        }
+
         // All servers: If RPC request or response contains term T > currentTerm:
         // set currentTerm = T, convert to follower (§5.1).
         let msg_term = match &msg {
@@ -291,6 +335,7 @@ impl RaftNode {
             RaftMessage::AppendEntriesResponse { term, .. } => *term,
             RaftMessage::RequestVote { term, .. } => *term,
             RaftMessage::RequestVoteResponse { term, .. } => *term,
+            RaftMessage::ForwardProposal { .. } => unreachable!(),
         };
         if msg_term > self.current_term {
             debug!(
@@ -350,6 +395,7 @@ impl RaftNode {
             } => {
                 out.extend(self.handle_request_vote_response(from, term, vote_granted));
             }
+            RaftMessage::ForwardProposal { .. } => unreachable!(),
         }
         out
     }
@@ -469,6 +515,11 @@ impl RaftNode {
     /// Highest committed index.
     pub fn commit_index(&self) -> u64 {
         self.commit_index
+    }
+
+    /// Highest log index applied via [`RaftNode::ready`].
+    pub fn last_applied(&self) -> u64 {
+        self.last_applied
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────

@@ -66,7 +66,9 @@ pub use coordinator::{
     IndexResponse, LocalSearcher, MergedSearchResult, SearchCoordinator, SearchTransport,
 };
 pub use metadata::{ClusterMetadata, IndexMetadata, NodeInfo, NodeState};
-pub use node::{ClusterNode, ClusterTransport};
+pub use node::{
+    ClusterApplier, ClusterHandle, ClusterNode, ClusterStatusSnapshot, ClusterTransport,
+};
 pub use raft::{ClusterCommand, LogEntry, RaftMessage, RaftNode, RaftState};
 pub use regions::{Region, RegionManager, RegionMove};
 pub use replication::{

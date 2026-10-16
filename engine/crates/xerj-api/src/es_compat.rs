@@ -21351,8 +21351,33 @@ pub async fn cat_nodes(
         .first()
         .map(|(_, a)| *a)
         .unwrap_or(std::net::SocketAddr::from(([127, 0, 0, 1], 9300)));
+    let cluster_status = state.engine.cluster_status();
+    let live_leader = cluster_status.as_ref().and_then(|s| s.leader_id.as_deref());
+    let self_cluster_id = cluster_status.as_ref().map(|s| s.node_id.as_str());
+    let own_addr_str = own_addr.to_string();
+    let addr_matches_leader = |addr: &std::net::SocketAddr, row_id: &str| -> bool {
+        let Some(leader) = live_leader else {
+            return false;
+        };
+        if leader == row_id {
+            return true;
+        }
+        state.config.cluster.peers.iter().any(|p| {
+            p.split_once('=').is_some_and(|(id, a)| {
+                id == leader && a.trim().parse::<std::net::SocketAddr>().ok().as_ref() == Some(addr)
+            })
+        })
+    };
     let master_col = if state.config.cluster.enabled {
-        "-"
+        if live_leader.is_some()
+            && (live_leader == Some(name)
+                || live_leader == self_cluster_id
+                || addr_matches_leader(&own_addr, own_addr_str.as_str()))
+        {
+            "*"
+        } else {
+            "-"
+        }
     } else {
         "*"
     };
@@ -21372,6 +21397,11 @@ pub async fn cat_nodes(
             "name": name,
         }));
         for (peer_id, addr) in members.iter().skip(1) {
+            let peer_master = if addr_matches_leader(addr, peer_id.as_str()) {
+                "*"
+            } else {
+                "-"
+            };
             rows.push(json!({
                 "ip": addr.ip().to_string(),
                 "heap.percent": "-",
@@ -21381,7 +21411,7 @@ pub async fn cat_nodes(
                 "load_5m": "-",
                 "load_15m": "-",
                 "node.role": "-",
-                "master": "-",
+                "master": peer_master,
                 "name": peer_id,
             }));
         }
@@ -21393,7 +21423,15 @@ pub async fn cat_nodes(
         ip = own_addr.ip(),
     );
     for (peer_id, addr) in members.iter().skip(1) {
-        body.push_str(&format!("{ip} - - - - - - - - {peer_id}\n", ip = addr.ip()));
+        let peer_master = if addr_matches_leader(addr, peer_id.as_str()) {
+            "*"
+        } else {
+            "-"
+        };
+        body.push_str(&format!(
+            "{ip} - - - - - - - {peer_master} {peer_id}\n",
+            ip = addr.ip()
+        ));
     }
     (
         StatusCode::OK,
@@ -32554,12 +32592,23 @@ pub async fn cluster_state(State(state): State<AppState>) -> impl IntoResponse {
         );
     }
 
+    let master_node = if state.config.cluster.enabled {
+        state
+            .engine
+            .cluster_status()
+            .and_then(|s| s.leader_id)
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    } else {
+        json!(node_id)
+    };
+
     Json(json!({
         "cluster_name": "xerj",
         "cluster_uuid": "xerj-cluster-1",
         "version": 1,
         "state_uuid": uuid::Uuid::new_v4().to_string(),
-        "master_node": if state.config.cluster.enabled { Value::Null } else { json!(node_id) },
+        "master_node": master_node,
         "blocks": {},
         "nodes": Value::Object(state_nodes),
         "metadata": {
@@ -46294,6 +46343,292 @@ mod cluster_topology_honesty_tests {
         // the headline, not a reason to hide the second problem.
         assert_eq!(body["xerj_cluster_transport"], "degraded");
         assert_eq!(body["number_of_nodes"], 1);
+    }
+
+    // ── #1170: Raft ring connected to Engine + REST ──────────────────────
+
+    async fn send_json(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+    ) -> (StatusCode, Value) {
+        let builder = Request::builder().method(method).uri(path);
+        let req = match body {
+            Some(payload) => builder
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, val)
+    }
+
+    async fn wait_for_ring_convergence(states: &[AppState], min_applied: u64) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let snapshots: Vec<_> = states
+                .iter()
+                .filter_map(|s| s.engine.cluster_status())
+                .collect();
+            if snapshots.len() == states.len() {
+                let max_commit = snapshots.iter().map(|s| s.commit_index).max().unwrap_or(0);
+                if max_commit >= min_applied
+                    && snapshots
+                        .iter()
+                        .all(|s| s.leader_id.is_some() && s.last_applied >= max_commit)
+                {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for 3-node Raft ring convergence (min_applied={min_applied}, snapshots={snapshots:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_ring_elects_leader_replicates_writes_and_updates_shard_routing() {
+        use xerj_cluster::node::in_memory::{InMemoryBus, InMemoryTransport};
+        use xerj_cluster::{ClusterNode, ClusterRunner};
+
+        let ports = [19310u16, 19311, 19312];
+        let ids: Vec<String> = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect();
+        let peer_specs: Vec<String> = ids.iter().map(|id| format!("{id}={id}")).collect();
+        let peer_refs: Vec<&str> = peer_specs.iter().map(String::as_str).collect();
+
+        let bus = InMemoryBus::new();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let mut states = Vec::new();
+        let mut apps = Vec::new();
+        let mut runner_handles = Vec::new();
+
+        for (i, &port) in ports.iter().enumerate() {
+            let state = state_with_cluster(true, &peer_refs, port);
+            let node_id = ids[i].clone();
+            let peer_ids: Vec<String> = ids.iter().filter(|id| *id != &node_id).cloned().collect();
+            let transport = InMemoryTransport::new(node_id.clone(), bus.clone()).await;
+            let mut node = ClusterNode::new(node_id, peer_ids, Box::new(transport));
+            state.engine.attach_cluster(&mut node);
+
+            let mut runner = ClusterRunner::new(
+                node,
+                std::time::Duration::from_millis(5),
+                shutdown_rx.clone(),
+            );
+            runner_handles.push(tokio::spawn(async move {
+                let _ = runner.run().await;
+            }));
+
+            apps.push(crate::router::build_es_compat_router(state.clone()));
+            states.push(state);
+        }
+
+        // 1. Wait for leader election across all 3 nodes.
+        wait_for_ring_convergence(&states, 0).await;
+        let leader_id = states[0]
+            .engine
+            .cluster_status()
+            .and_then(|s| s.leader_id)
+            .expect("elected leader_id");
+        let leader_idx = ids
+            .iter()
+            .position(|id| id == &leader_id)
+            .expect("leader in ring");
+        let follower_idx = (leader_idx + 1) % 3;
+
+        // Every node's /_cluster/state and /_cat/nodes now surfaces the live Raft leader.
+        for (idx, app) in apps.iter().enumerate() {
+            let (status, state_body) = get(app, "/_cluster/state").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(state_body["master_node"], leader_id);
+
+            let (status, cat_body) = get(app, "/_cat/nodes?format=json").await;
+            assert_eq!(status, StatusCode::OK);
+            let rows = cat_body.as_array().expect("rows");
+            assert_eq!(rows.len(), 3);
+            let starred: Vec<&Value> = rows.iter().filter(|r| r["master"] == "*").collect();
+            assert_eq!(
+                starred.len(),
+                1,
+                "exactly one row must be marked master '*'"
+            );
+            if idx == leader_idx {
+                assert_eq!(rows[0]["master"], "*", "leader's self row must be '*'");
+            } else {
+                assert_eq!(rows[0]["master"], "-", "follower's self row must be '-'");
+                assert_eq!(
+                    starred[0]["name"], leader_id,
+                    "follower must mark leader peer row as '*'"
+                );
+            }
+        }
+
+        // 2. Create index with explicit mapping on the leader; verify replication + ShardRouter.
+        let (status, _) = send_json(
+            &apps[leader_idx],
+            "PUT",
+            "/orders",
+            Some(
+                json!({
+                    "mappings": {
+                        "properties": {
+                            "item": { "type": "keyword" },
+                            "qty": { "type": "long" }
+                        }
+                    }
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // CreateIndex + UpdateMapping + Leader auto-AssignShard = 3 committed entries.
+        wait_for_ring_convergence(&states, 3).await;
+
+        for (idx, (state, app)) in states.iter().zip(apps.iter()).enumerate() {
+            assert!(
+                state.engine.get_index("orders").is_ok(),
+                "node {idx} must have replicated index 'orders'"
+            );
+            let (m_status, m_body) = get(app, "/orders/_mapping").await;
+            assert_eq!(m_status, StatusCode::OK);
+            assert_eq!(
+                m_body["orders"]["mappings"]["properties"]["item"]["type"], "keyword",
+                "node {idx} must have replicated mapping"
+            );
+            let router = state.engine.shard_router.read();
+            let (shard_id, routed_node) = router.route_doc("orders", "doc-1");
+            assert_eq!(shard_id, 0);
+            assert_eq!(
+                routed_node,
+                Some(leader_id.as_str()),
+                "node {idx} ShardRouter must route shard 0 primary to leader"
+            );
+            assert_eq!(
+                router.search_targets("orders"),
+                vec![leader_id.clone()],
+                "node {idx} ShardRouter search_targets must list leader"
+            );
+        }
+
+        // 3. Single-document write on leader replicates to all followers.
+        let (status, _) = send_json(
+            &apps[leader_idx],
+            "PUT",
+            "/orders/_doc/doc-1",
+            Some(json!({ "item": "keyboard", "qty": 5 }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        wait_for_ring_convergence(&states, 4).await;
+
+        for (idx, app) in apps.iter().enumerate() {
+            let (g_status, g_body) = get(app, "/orders/_doc/doc-1").await;
+            assert_eq!(
+                g_status,
+                StatusCode::OK,
+                "node {idx} must serve replicated doc-1"
+            );
+            assert_eq!(g_body["found"], true);
+            assert_eq!(g_body["_source"]["item"], "keyboard");
+            assert_eq!(g_body["_source"]["qty"], 5);
+        }
+
+        // 4. Bulk write on leader replicates to all followers.
+        let bulk_payload = concat!(
+            "{\"index\":{\"_index\":\"orders\",\"_id\":\"doc-2\"}}\n",
+            "{\"item\":\"mouse\",\"qty\":12}\n",
+            "{\"index\":{\"_index\":\"orders\",\"_id\":\"doc-3\"}}\n",
+            "{\"item\":\"monitor\",\"qty\":2}\n",
+        );
+        let (status, bulk_res) = send_json(
+            &apps[leader_idx],
+            "POST",
+            "/orders/_bulk",
+            Some(bulk_payload.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(bulk_res["errors"], false);
+        wait_for_ring_convergence(&states, 5).await;
+
+        for (idx, app) in apps.iter().enumerate() {
+            for (doc_id, expected_item) in [("doc-2", "mouse"), ("doc-3", "monitor")] {
+                let (g_status, g_body) = get(app, &format!("/orders/_doc/{doc_id}")).await;
+                assert_eq!(
+                    g_status,
+                    StatusCode::OK,
+                    "node {idx} must serve bulk-replicated {doc_id}"
+                );
+                assert_eq!(g_body["_source"]["item"], expected_item);
+            }
+        }
+
+        // 5. Delete document on leader replicates to all followers.
+        let (status, _) = send_json(&apps[leader_idx], "DELETE", "/orders/_doc/doc-1", None).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_for_ring_convergence(&states, 6).await;
+
+        for (idx, app) in apps.iter().enumerate() {
+            let (g_status, g_body) = get(app, "/orders/_doc/doc-1").await;
+            assert_eq!(
+                g_status,
+                StatusCode::NOT_FOUND,
+                "node {idx} must reflect replicated deletion of doc-1"
+            );
+            assert_eq!(g_body["found"], false);
+        }
+
+        // 6. Write document on a FOLLOWER node — forwarded to leader via ForwardProposal
+        //    and replicated across all 3 nodes.
+        let (status, _) = send_json(
+            &apps[follower_idx],
+            "PUT",
+            "/orders/_doc/doc-from-follower",
+            Some(json!({ "item": "headset", "qty": 9 }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        wait_for_ring_convergence(&states, 7).await;
+
+        for (idx, app) in apps.iter().enumerate() {
+            let (g_status, g_body) = get(app, "/orders/_doc/doc-from-follower").await;
+            assert_eq!(
+                g_status,
+                StatusCode::OK,
+                "node {idx} must serve follower-forwarded doc-from-follower"
+            );
+            assert_eq!(g_body["_source"]["item"], "headset");
+            assert_eq!(g_body["_source"]["qty"], 9);
+        }
+
+        // 7. Delete index on follower — forwarded to leader and replicated across all 3 nodes.
+        let (status, _) = send_json(&apps[follower_idx], "DELETE", "/orders", None).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_for_ring_convergence(&states, 8).await;
+
+        for (idx, state) in states.iter().enumerate() {
+            assert!(
+                state.engine.get_index("orders").is_err(),
+                "node {idx} must have deleted index 'orders'"
+            );
+        }
+
+        let _ = shutdown_tx.send(true);
+        for handle in runner_handles {
+            handle.abort();
+        }
     }
 }
 

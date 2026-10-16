@@ -9320,9 +9320,36 @@ pub struct Index {
     /// paying the old O(text) cost shows it here and nowhere else.
     /// `Arc` because the merge encode runs in `spawn_blocking`.
     merge_fts_reanalysed_docs: Arc<AtomicU64>,
+    /// Optional Raft cluster handle + re-entrancy depth counter bound by `Engine` (#1170).
+    cluster_state: parking_lot::RwLock<
+        Option<(
+            xerj_cluster::ClusterHandle,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+    >,
 }
 
 impl Index {
+    /// Bind or clear the Raft cluster handle and apply-depth counter (#1170).
+    pub fn set_cluster_state(
+        &self,
+        state: Option<(
+            xerj_cluster::ClusterHandle,
+            Arc<std::sync::atomic::AtomicUsize>,
+        )>,
+    ) {
+        *self.cluster_state.write() = state;
+    }
+
+    fn active_cluster_handle(&self) -> Option<xerj_cluster::ClusterHandle> {
+        let guard = self.cluster_state.read();
+        let (handle, depth) = guard.as_ref()?;
+        if depth.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return None;
+        }
+        Some(handle.clone())
+    }
+
     /// Apply a WAL-consumer retention floor to this index's WAL shards, live.
     ///
     /// #320. Called by [`Engine`](crate::engine::Engine) immediately after
@@ -9729,6 +9756,7 @@ impl Index {
             merge_evaluations: AtomicU64::new(0),
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             schema_persist_failures: AtomicU64::new(0),
+            cluster_state: parking_lot::RwLock::new(None),
         });
         // #871 — event-driven merge scheduling: the store fires this hook on
         // every segment-set change (flush publication, merge application,
@@ -10176,6 +10204,7 @@ impl Index {
             merge_evaluations: AtomicU64::new(0),
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             schema_persist_failures: AtomicU64::new(0),
+            cluster_state: parking_lot::RwLock::new(None),
         });
         // #871 — event-driven merge scheduling (see `Index::create` and
         // `request_merge_check`): wire the store's segments-changed hook.
@@ -10618,8 +10647,8 @@ impl Index {
 
         #[cfg(test)]
         self.publication_test_point(&doc_id, PublicationTestPoint::BeforeRelease);
-        Ok(IndexResponse {
-            id: doc_id,
+        let response = IndexResponse {
+            id: doc_id.clone(),
             seq_no,
             version: external_version
                 .map(|(version, _)| version)
@@ -10629,7 +10658,23 @@ impl Index {
             } else {
                 "created".to_string()
             },
-        })
+        };
+        drop(_publication_guard);
+        if let Some(handle) = self.active_cluster_handle() {
+            if let Ok(source_json) = serde_json::to_string(&source) {
+                let _ = handle
+                    .replicate_preapplied(
+                        xerj_cluster::ClusterCommand::IndexDocument {
+                            index: self.name.as_str().to_string(),
+                            doc_id,
+                            source_json,
+                        },
+                        std::time::Duration::from_millis(250),
+                    )
+                    .await;
+            }
+        }
+        Ok(response)
     }
 
     /// Batch index multiple documents using the turbo pipeline.
@@ -11014,6 +11059,28 @@ impl Index {
 
         debug!(batch = batch_len, elapsed_ms, "turbo batch indexed");
 
+        if let Some(handle) = self.active_cluster_handle() {
+            let cluster_docs: Vec<(String, String)> = processed
+                .iter()
+                .filter_map(|ingest| {
+                    serde_json::to_string(ingest.source.as_ref())
+                        .ok()
+                        .map(|s| (ingest.id.clone(), s))
+                })
+                .collect();
+            if !cluster_docs.is_empty() {
+                let _ = handle
+                    .replicate_preapplied(
+                        xerj_cluster::ClusterCommand::BulkIndexDocuments {
+                            index: self.name.as_str().to_string(),
+                            docs: cluster_docs,
+                        },
+                        std::time::Duration::from_millis(250),
+                    )
+                    .await;
+            }
+        }
+
         Ok(responses)
     }
 
@@ -11368,6 +11435,29 @@ impl Index {
             m.observe_index(elapsed_ms as f64 / 1000.0);
         }
 
+        if let Some(handle) = self.active_cluster_handle() {
+            let cluster_docs: Vec<(String, String)> = docs
+                .iter()
+                .zip(&sources)
+                .filter_map(|((id, _), source)| {
+                    serde_json::to_string(source.as_ref())
+                        .ok()
+                        .map(|s| (id.clone(), s))
+                })
+                .collect();
+            if !cluster_docs.is_empty() {
+                let _ = handle
+                    .replicate_preapplied(
+                        xerj_cluster::ClusterCommand::BulkIndexDocuments {
+                            index: self.name.as_str().to_string(),
+                            docs: cluster_docs,
+                        },
+                        std::time::Duration::from_millis(250),
+                    )
+                    .await;
+            }
+        }
+
         Ok(responses)
     }
 
@@ -11622,6 +11712,15 @@ impl Index {
         } else {
             Vec::new()
         };
+        let cluster_docs: Option<Vec<(String, String)>> = self.active_cluster_handle().map(|_| {
+            docs.iter()
+                .filter_map(|(id, bytes, _)| {
+                    std::str::from_utf8(bytes.as_ref())
+                        .ok()
+                        .map(|s| (id.clone(), s.to_string()))
+                })
+                .collect()
+        });
         let n_shards = self.memtable.shard_count().max(1);
         let mut buckets: Vec<Vec<(u64, String, Arc<[u8]>, Option<Arc<Value>>)>> =
             (0..n_shards).map(|_| Vec::new()).collect();
@@ -11706,6 +11805,15 @@ impl Index {
         // RC4 W4 item 2: end-to-end latency of this indexing (batch) call.
         if let Some(m) = crate::engine_metrics() {
             m.observe_index(elapsed_ms as f64 / 1000.0);
+        }
+
+        if let (Some(handle), Some(cluster_docs)) = (self.active_cluster_handle(), cluster_docs) {
+            if !cluster_docs.is_empty() {
+                handle.submit_preapplied(xerj_cluster::ClusterCommand::BulkIndexDocuments {
+                    index: self.name.as_str().to_string(),
+                    docs: cluster_docs,
+                });
+            }
         }
 
         Ok(batch_len)
@@ -11940,6 +12048,28 @@ impl Index {
             batch = batch_len,
             elapsed_ms, "turbo-realtime batch indexed (no WAL)"
         );
+
+        if let Some(handle) = self.active_cluster_handle() {
+            let cluster_docs: Vec<(String, String)> = processed
+                .iter()
+                .filter_map(|ingest| {
+                    serde_json::to_string(ingest.source.as_ref())
+                        .ok()
+                        .map(|s| (ingest.id.clone(), s))
+                })
+                .collect();
+            if !cluster_docs.is_empty() {
+                let _ = handle
+                    .replicate_preapplied(
+                        xerj_cluster::ClusterCommand::BulkIndexDocuments {
+                            index: self.name.as_str().to_string(),
+                            docs: cluster_docs,
+                        },
+                        std::time::Duration::from_millis(250),
+                    )
+                    .await;
+            }
+        }
 
         Ok(responses)
     }
@@ -19022,6 +19152,18 @@ impl Index {
 
         #[cfg(test)]
         self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
+        drop(_publication_guard);
+        if let Some(handle) = self.active_cluster_handle() {
+            let _ = handle
+                .replicate_preapplied(
+                    xerj_cluster::ClusterCommand::DeleteDocument {
+                        index: self.name.as_str().to_string(),
+                        doc_id: id.to_string(),
+                    },
+                    std::time::Duration::from_millis(250),
+                )
+                .await;
+        }
         Ok(DeleteDocOutcome {
             found: true,
             seq_no,
