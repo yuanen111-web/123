@@ -521,4 +521,88 @@ mod write_back {
             .await;
         assert_eq!(st, StatusCode::NOT_FOUND, "no index was created: {st} {r}");
     }
+
+    /// Issue #1094: once the history index has BM25 support for common stop
+    /// words, split votes whose winning share is below `escalate_below` (default
+    /// 0.8) MUST escalate to `local` on both `/_decide` and `/v1/systemone` and
+    /// write the local judgement back into `[decisions] index` — unfreezing the
+    /// flywheel instead of locking the cache at 12 documents.
+    #[tokio::test]
+    async fn split_history_below_escalate_below_escalates_to_local_and_writes_back() {
+        let ln = local_node("history", 0.0).await;
+        let node = &ln.node;
+        node.create_index("history").await;
+        // Two seeded neighbours sharing the token `refund` with opposite labels:
+        // rank 0 gets weight 1.0, rank 1 gets weight 0.5 → winning share 2/3 ≈ 0.6667 < 0.8.
+        node.put_doc(
+            "history",
+            "h_true",
+            json!({"text": "refund money back request", "label": "true"}),
+        )
+        .await;
+        node.put_doc(
+            "history",
+            "h_false",
+            json!({"text": "refund inquiry status", "label": "not true"}),
+        )
+        .await;
+        node.refresh("history").await;
+        assert_eq!(node.docs("history").await.len(), 2);
+
+        // 1. `/_decide` escalates the split 2/3 vote (< 0.8) to `local` and caches the judgement.
+        let (st, r) = node
+            .decide(json!({"index": "history", "question": "refund money back check"}))
+            .await;
+        assert!(st.is_success(), "{st} {r}");
+        assert_eq!(
+            r["tier"], "local",
+            "split history vote (2/3 < 0.8) must escalate to local: {r}"
+        );
+        assert_eq!(r["source"], "local", "{r}");
+        let docs = node.wait_for_docs("history", 3).await;
+        assert_eq!(
+            docs.len(),
+            3,
+            "local escalation wrote back to history: {docs:?}"
+        );
+
+        // 2. `/v1/systemone` on another split index also escalates and writes back.
+        let ln2 = local_node("history_s1", 0.0).await;
+        let node2 = &ln2.node;
+        node2.create_index("history_s1").await;
+        node2
+            .put_doc(
+                "history_s1",
+                "s_true",
+                json!({"text": "invoice payment dispute", "label": "true"}),
+            )
+            .await;
+        node2
+            .put_doc(
+                "history_s1",
+                "s_false",
+                json!({"text": "invoice summary receipt", "label": "not true"}),
+            )
+            .await;
+        node2.refresh("history_s1").await;
+
+        let (st, r2) = node2
+            .systemone(json!({
+                "state": {"documents": {"doc_0": "invoice payment question"}},
+                "questions": {"d0": {"type": "noul", "instructions": "Is `documents.doc_0` a dispute?"}}
+            }))
+            .await;
+        assert!(st.is_success(), "{st} {r2}");
+        assert_eq!(
+            r2["decisions"]["evidence"]["d0"]["tier"], "local",
+            "split history vote on /v1/systemone escalates to local: {r2}"
+        );
+        assert_eq!(r2["decisions"]["evidence"]["d0"]["source"], "local", "{r2}");
+        let docs2 = node2.wait_for_docs("history_s1", 3).await;
+        assert_eq!(
+            docs2.len(),
+            3,
+            "/v1/systemone escalation wrote back to history_s1: {docs2:?}"
+        );
+    }
 }

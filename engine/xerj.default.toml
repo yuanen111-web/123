@@ -1,6 +1,6 @@
 # xerj Default Configuration
 # ============================================================
-# This file sets 55 of XERJ's 132 user-facing settings to their
+# This file sets 55 of XERJ's 133 user-facing settings to their
 # production-ready defaults, and describes the rest in comments.
 # Every value here IS the default, so copying this file changes
 # nothing until you edit it (a test enforces that). The complete
@@ -679,6 +679,7 @@ access_log = false
 # text_field     = "text"
 # positive_label = "true"         # the label a noul's probability is the share of
 # min_confidence = 0.0            # /_decide abstains below this
+# escalate_below = 0.8            # escalate tier-1 vote to tier-2 local head below this winning share (0.0 disables; #1094)
 # human_weight   = 2.0            # vote-weight multiplier for history docs carrying human: true
 # calibration    = "none"         # none | isotonic | temperature — p_cal beside every p_raw (#1063)
 

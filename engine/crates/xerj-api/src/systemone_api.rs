@@ -186,10 +186,11 @@ pub enum DecideTier {
 
 /// What the history index said for one question. The ladder treats every
 /// no-support outcome the same way: the local head may answer it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HistorySupport {
-    /// Labelled neighbours came back.
-    Supported,
+    /// Labelled neighbours came back; the `f64` is the winning label's share
+    /// of the total vote weight (`0.0..=1.0`).
+    Supported(f64),
     /// No `[decisions] index` is configured at all.
     NotConfigured,
     /// The configured index does not exist or could not be searched; the
@@ -202,9 +203,25 @@ pub(crate) enum HistorySupport {
 
 /// Resolve the ladder for one question. Pure, and unit-tested: the order is
 /// the contract.
-pub(crate) fn resolve_tier(support: &HistorySupport, local_enabled: bool) -> Option<DecideTier> {
+///
+/// When `local_enabled` is true and a history vote's winning share is strictly
+/// below `escalate_below` (`#1094`), the question escalates to
+/// `DecideTier::Local` so the local head answers and caches its judgement into
+/// the history index. When `local_enabled` is false, a low-share vote still
+/// resolves to `DecideTier::History`.
+pub(crate) fn resolve_tier(
+    support: &HistorySupport,
+    escalate_below: f64,
+    local_enabled: bool,
+) -> Option<DecideTier> {
     match support {
-        HistorySupport::Supported => Some(DecideTier::History),
+        HistorySupport::Supported(share) => {
+            if local_enabled && *share < escalate_below {
+                Some(DecideTier::Local)
+            } else {
+                Some(DecideTier::History)
+            }
+        }
         HistorySupport::NotConfigured
         | HistorySupport::Unusable(_)
         | HistorySupport::NoLabelledNeighbour => {
@@ -893,7 +910,13 @@ pub async fn systemone(
                 if labelled.is_empty() || !criteria_ok {
                     // Tier 2: the local head answers what the history
                     // cannot; without it the documented errors stand.
-                    if resolve_tier(&HistorySupport::NoLabelledNeighbour, local_enabled).is_some() {
+                    if resolve_tier(
+                        &HistorySupport::NoLabelledNeighbour,
+                        cfg.escalate_below,
+                        local_enabled,
+                    )
+                    .is_some()
+                    {
                         local_needed.push((i, labels_for(question, &cfg)));
                     } else {
                         unsupported.push(id.clone());
@@ -905,8 +928,28 @@ pub async fn systemone(
                 for (w, label) in &labelled {
                     *weight_by_label.entry(label).or_insert(0.0) += *w;
                 }
+                let (best_label, best_weight) = weight_by_label
+                    .iter()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .expect("non-empty");
                 let share =
                     |label: &str| weight_by_label.get(label).copied().unwrap_or(0.0) / total;
+                let winning_share = match &question.kind {
+                    Kind::Noul => *best_weight / total,
+                    Kind::Choice { options } => options
+                        .iter()
+                        .map(|o| share(o.as_str()))
+                        .fold(0.0_f64, f64::max),
+                };
+                if resolve_tier(
+                    &HistorySupport::Supported(winning_share),
+                    cfg.escalate_below,
+                    local_enabled,
+                ) == Some(DecideTier::Local)
+                {
+                    local_needed.push((i, labels_for(question, &cfg)));
+                    continue;
+                }
                 match &question.kind {
                     Kind::Noul => {
                         // Exactly the documented fields — clients parse answers
@@ -943,10 +986,6 @@ pub async fn systemone(
                         );
                     }
                 }
-                let (best_label, best_weight) = weight_by_label
-                    .iter()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .expect("non-empty");
                 let mut evidence_value = json!({
                     "tier": DecideTier::History.as_str(),
                     "source": DecideTier::History.as_str(),
@@ -969,7 +1008,7 @@ pub async fn systemone(
                 evidence.insert(id.clone(), evidence_value);
             }
             Err(failure) => {
-                match resolve_tier(&failure, local_enabled) {
+                match resolve_tier(&failure, cfg.escalate_below, local_enabled) {
                     Some(DecideTier::Local) => {
                         local_needed.push((i, labels_for(question, &cfg)));
                     }
@@ -1246,16 +1285,28 @@ pub async fn decide(
     } else {
         vote_neighbours(&state, &cfg, &clip(&question, MAX_VOTE_TEXT_CHARS)).await
     };
-    // The ladder, /_decide-shaped: an empty or unreachable history hands the
-    // question to the local head; with no tier able to answer, the audit
-    // surface does what it always did — abstain on zero support, error on an
-    // unusable index.
-    let support = match &neighbours {
-        Ok(n) if n.is_empty() => HistorySupport::NoLabelledNeighbour,
-        Ok(_) => HistorySupport::Supported,
-        Err(failure) => failure.clone(),
+    // The ladder, /_decide-shaped: an empty, unreachable, or below-floor
+    // history hands the question to the local head; with no tier able to
+    // answer, the audit surface does what it always did — abstain on zero
+    // support, error on an unusable index.
+    let (support, total, weight_by_label) = match &neighbours {
+        Ok(n) if n.is_empty() => (HistorySupport::NoLabelledNeighbour, 0.0, BTreeMap::new()),
+        Ok(n) => {
+            let total: f64 = n.iter().map(|(w, _, _)| *w).sum();
+            let mut by_label: BTreeMap<String, f64> = BTreeMap::new();
+            for (w, label, _) in n {
+                *by_label.entry(label.to_string()).or_insert(0.0) += *w;
+            }
+            let winning_share = if total > 0.0 {
+                by_label.values().copied().fold(0.0_f64, f64::max) / total
+            } else {
+                0.0
+            };
+            (HistorySupport::Supported(winning_share), total, by_label)
+        }
+        Err(failure) => (failure.clone(), 0.0, BTreeMap::new()),
     };
-    if resolve_tier(&support, local.is_some()) == Some(DecideTier::Local) {
+    if resolve_tier(&support, cfg.escalate_below, local.is_some()) == Some(DecideTier::Local) {
         #[cfg(feature = "decide-local")]
         {
             let Some(local) = local.as_ref() else {
@@ -1273,11 +1324,6 @@ pub async fn decide(
             return index_error(&cfg.index, &cause);
         }
     };
-    let total: f64 = neighbours.iter().map(|(w, _, _)| *w).sum();
-    let mut weight_by_label: BTreeMap<String, f64> = BTreeMap::new();
-    for (w, label, _) in &neighbours {
-        *weight_by_label.entry(label.to_string()).or_insert(0.0) += *w;
-    }
     // The calibrated quantity (#1063): the positive label's share — the same
     // quantity a noul answers on the wire — NOT the winner's share that
     // `confidence` reports. `confidence` keeps its raw meaning and the
@@ -1906,31 +1952,57 @@ mod tests {
         ]
     }
 
-    /// Tier 1 wins wherever it has support — even with the local head armed,
-    /// it never overrides measured evidence. Every no-support class falls to
-    /// the local head when armed, and to nothing (the documented errors) when
-    /// not. The hosted tier is reserved: it never resolves.
+    /// Tier 1 wins wherever it has confident support (`share >= escalate_below`).
+    /// When the local head is armed and the history winner's share falls below
+    /// `escalate_below`, the question escalates to tier 2 (`Local`) so the
+    /// flywheel does not freeze once BM25 starts matching split neighbours
+    /// (#1094). Without the local tier armed, low-share history votes stay on
+    /// `History` and answer or abstain as before. Every no-support class falls
+    /// to the local head when armed, and to nothing (the documented errors)
+    /// when not. The hosted tier is reserved: it never resolves.
     #[test]
     fn tier_order_is_history_then_local_then_the_documented_errors() {
         for support in no_support_classes() {
             assert_eq!(
-                resolve_tier(&support, false),
+                resolve_tier(&support, 0.8, false),
                 None,
                 "{support:?}: no local tier → the documented error stands"
             );
         }
         assert_eq!(
-            resolve_tier(&HistorySupport::Supported, false),
+            resolve_tier(&HistorySupport::Supported(1.0), 0.8, false),
             Some(DecideTier::History)
         );
-        // History wins even with the local tier armed.
+        // Confident history (`share >= escalate_below`) wins even with the local tier armed.
         assert_eq!(
-            resolve_tier(&HistorySupport::Supported, true),
+            resolve_tier(&HistorySupport::Supported(1.0), 0.8, true),
             Some(DecideTier::History)
+        );
+        assert_eq!(
+            resolve_tier(&HistorySupport::Supported(0.8), 0.8, true),
+            Some(DecideTier::History),
+            "at the floor (`share == escalate_below`) history holds"
+        );
+        // Split / low-share history (`share < escalate_below`) escalates to local
+        // when armed, and stays on history when not (#1094).
+        assert_eq!(
+            resolve_tier(&HistorySupport::Supported(2.0 / 3.0), 0.8, true),
+            Some(DecideTier::Local),
+            "a 2-to-1 split (0.667 < 0.8) escalates to the local head when armed"
+        );
+        assert_eq!(
+            resolve_tier(&HistorySupport::Supported(2.0 / 3.0), 0.8, false),
+            Some(DecideTier::History),
+            "without a local tier, low-share history stays on history"
+        );
+        assert_eq!(
+            resolve_tier(&HistorySupport::Supported(0.5), 0.0, true),
+            Some(DecideTier::History),
+            "escalate_below = 0.0 disables confidence escalation"
         );
         for support in no_support_classes() {
             assert_eq!(
-                resolve_tier(&support, true),
+                resolve_tier(&support, 0.8, true),
                 Some(DecideTier::Local),
                 "{support:?}: the local head answers what history cannot"
             );
@@ -2075,6 +2147,30 @@ mod tests {
             ))
             .expect_err(bad);
             assert!(err.to_string().contains("human_weight"), "{bad}: {err}");
+        }
+    }
+
+    /// `[decisions] escalate_below` defaults to 0.8 (matching the gate's
+    /// confidence bar so split BM25 votes escalate to tier 2 and unfreeze the
+    /// flywheel) and validates `0.0..=1.0` (#1094).
+    #[test]
+    fn escalate_below_is_configurable_and_range_checked() {
+        assert_eq!(DecisionsConfig::default().escalate_below, 0.8);
+        let cfg = xerj_common::config::Config::from_toml_str(
+            "[decisions]\nindex = \"judgements\"\nescalate_below = 0.65\n",
+        )
+        .expect("toml");
+        assert_eq!(cfg.decisions.escalate_below, 0.65);
+        let disabled =
+            xerj_common::config::Config::from_toml_str("[decisions]\nescalate_below = 0.0\n")
+                .expect("0.0 disables confidence escalation");
+        assert_eq!(disabled.decisions.escalate_below, 0.0);
+        for bad in ["-0.1", "1.1", "nan"] {
+            let err = xerj_common::config::Config::from_toml_str(&format!(
+                "[decisions]\nescalate_below = {bad}\n"
+            ))
+            .expect_err(bad);
+            assert!(err.to_string().contains("escalate_below"), "{bad}: {err}");
         }
     }
 
