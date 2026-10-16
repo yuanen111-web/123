@@ -1,13 +1,13 @@
 # Contributor License Agreement
 
-> **Maintainer note — this needs your review before it is relied upon.**
-> This document is adapted from the [Apache Software Foundation Individual
-> Contributor License Agreement v2.0](https://www.apache.org/licenses/icla.pdf),
+> **Maintainer note.** This document is adapted from the [Apache Software
+> Foundation Individual Contributor License Agreement v2.0](https://www.apache.org/licenses/icla.pdf),
 > the standard instrument for Apache-2.0 projects. It has **not** been reviewed
-> by a lawyer on this project's behalf. Two placeholders must be filled in
-> before it is authoritative — the legal entity named as **the Project Owner**,
-> and the contact address in "Notifying us". If XERJ is ever to be relicensed or
-> offered commercially, have counsel confirm this text grants what you need.
+> by a lawyer on this project's behalf. The Project Owner for this agreement is
+> **YongxinFu**, the individual maintainer operating the project through the
+> `xerj-org` GitHub account. Notices under section 7 can be sent to
+> **git@xerj.org**. If XERJ is ever to be relicensed or offered commercially,
+> have counsel confirm this text grants what you need.
 
 Thank you for contributing to XERJ. This agreement clarifies the intellectual
 property licence granted with Contributions from any person or entity, and
@@ -101,7 +101,7 @@ aware, and conspicuously marking the work as
 
 You agree to notify the Project Owner of any facts or circumstances of which
 you become aware that would make these representations inaccurate in any
-respect. Contact: **[MAINTAINER CONTACT — fill in]**.
+respect. Contact: **git@xerj.org**.
 
 ---
 
