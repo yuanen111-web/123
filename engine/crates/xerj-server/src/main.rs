@@ -121,14 +121,38 @@ struct CliArgs {
 }
 
 fn parse_args() -> CliArgs {
-    parse_args_from(std::env::args().skip(1))
+    parse_args_from(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+/// The value that must follow `flag`. A flag given last on the line, or
+/// followed straight by another `--flag`, has no value: that is an error, not
+/// a silent "unset" — `xerj --insecure --data-dir` used to boot on the default
+/// data directory, and `xerj --data-dir --insecure` used a directory literally
+/// named `--insecure` and left auth on (#1435). The short forms are the same
+/// trap — `xerj --data-dir -k` must not name the directory `-k` and drop
+/// `--insecure` — so a single dash plus one letter counts as a flag too; any
+/// longer single-dash value (`-data`, `-1`, `::1`) is still a value.
+fn flag_value(flag: &str, next: Option<String>) -> Result<String, String> {
+    match next {
+        Some(v) if !looks_like_flag(&v) => Ok(v),
+        Some(v) => Err(format!("{flag} needs a value, got the flag {v}")),
+        None => Err(format!("{flag} needs a value")),
+    }
+}
+
+/// `--anything`, or a short flag such as `-k` / `-d`.
+fn looks_like_flag(v: &str) -> bool {
+    v.starts_with("--") || matches!(v.as_bytes(), [b'-', c] if c.is_ascii_alphabetic())
 }
 
 /// The body of [`parse_args`], over any iterator of arguments — the same
 /// testable-parse shape as `brain::parse` and `share::parse`, so the CLI
 /// grammar is unit-tested without touching process-wide `argv` (which every
 /// test in the same binary shares).
-fn parse_args_from<I>(args: I) -> CliArgs
+fn parse_args_from<I>(args: I) -> Result<CliArgs, String>
 where
     I: Iterator<Item = String>,
 {
@@ -149,29 +173,29 @@ where
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" | "-c" => {
-                config = args.next().map(PathBuf::from);
+                config = Some(PathBuf::from(flag_value(&arg, args.next())?));
             }
             "--data-dir" | "-d" => {
-                data_dir = args.next();
+                data_dir = Some(flag_value(&arg, args.next())?);
             }
             "--bind" | "-b" => {
-                bind = args.next();
+                bind = Some(flag_value(&arg, args.next())?);
             }
             "--port" => {
-                port = args.next();
+                port = Some(flag_value(&arg, args.next())?);
             }
             "--insecure" | "-k" => {
                 insecure = true;
             }
             "--embed-mode" => {
-                embed_mode = args.next();
+                embed_mode = Some(flag_value(&arg, args.next())?);
             }
-            "--onnx-model" => onnx_model = args.next(),
-            "--onnx-tokenizer" => onnx_tokenizer = args.next(),
-            "--compat-distribution" => compat_distribution = args.next(),
-            "--compat-version" => compat_version = args.next(),
-            "--decide-mode" => decide_mode = args.next(),
-            "--decide-model-dir" => decide_model_dir = args.next(),
+            "--onnx-model" => onnx_model = Some(flag_value(&arg, args.next())?),
+            "--onnx-tokenizer" => onnx_tokenizer = Some(flag_value(&arg, args.next())?),
+            "--compat-distribution" => compat_distribution = Some(flag_value(&arg, args.next())?),
+            "--compat-version" => compat_version = Some(flag_value(&arg, args.next())?),
+            "--decide-mode" => decide_mode = Some(flag_value(&arg, args.next())?),
+            "--decide-model-dir" => decide_model_dir = Some(flag_value(&arg, args.next())?),
             // Read out of band by `xerj_common::feedback` (which scans the
             // whole argument list, so its position never matters); accepted
             // here only so it is not an "unknown argument".
@@ -191,7 +215,7 @@ where
         }
     }
 
-    CliArgs {
+    Ok(CliArgs {
         config,
         data_dir,
         bind,
@@ -204,7 +228,7 @@ where
         compat_version,
         decide_mode,
         decide_model_dir,
-    }
+    })
 }
 
 fn print_help() {
@@ -1246,6 +1270,29 @@ struct IndexCmdArgs {
     data_dir: Option<String>,
 }
 
+/// `xerj index`'s string flag value; exits 2 on a missing one (see [`flag_value`]).
+fn index_flag_value(flag: &str, next: Option<String>) -> String {
+    flag_value(flag, next).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+/// `xerj index`'s numeric flag value. `--batch abc` used to fall back to the
+/// default without a word, so a typo silently changed the run (#1435).
+fn index_flag_count(flag: &str, next: Option<String>) -> usize {
+    parse_count(flag, next).unwrap_or_else(|e| {
+        eprintln!("error: {e}. Use --help for usage.");
+        std::process::exit(2);
+    })
+}
+
+fn parse_count(flag: &str, next: Option<String>) -> Result<usize, String> {
+    let v = flag_value(flag, next)?;
+    v.parse()
+        .map_err(|_| format!("{flag} must be a non-negative whole number, got {v:?}"))
+}
+
 fn parse_index_args() -> IndexCmdArgs {
     // Skip argv[0] (binary) + argv[1] ("index").
     let mut args = std::env::args().skip(2);
@@ -1259,19 +1306,13 @@ fn parse_index_args() -> IndexCmdArgs {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--index" | "-i" => index = args.next(),
-            "--file" | "-f" => file = args.next().map(PathBuf::from),
-            "--batch" | "-b" => {
-                batch = args.next().and_then(|s| s.parse().ok()).unwrap_or(5000);
-            }
-            "--workers" | "-w" => {
-                workers = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            "--limit" | "-l" => {
-                limit = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-            "--config" | "-c" => config = args.next().map(PathBuf::from),
-            "--data-dir" | "-d" => data_dir = args.next(),
+            "--index" | "-i" => index = Some(index_flag_value(&arg, args.next())),
+            "--file" | "-f" => file = Some(PathBuf::from(index_flag_value(&arg, args.next()))),
+            "--batch" | "-b" => batch = index_flag_count(&arg, args.next()),
+            "--workers" | "-w" => workers = index_flag_count(&arg, args.next()),
+            "--limit" | "-l" => limit = index_flag_count(&arg, args.next()),
+            "--config" | "-c" => config = Some(PathBuf::from(index_flag_value(&arg, args.next()))),
+            "--data-dir" | "-d" => data_dir = Some(index_flag_value(&arg, args.next())),
             xerj_common::feedback::DISABLE_FLAG => {}
             "--help" | "-h" => {
                 print_index_help();
@@ -2017,12 +2058,54 @@ mod decide_flag_tests {
             "local",
             "--decide-model-dir",
             "/models/xerj-decide",
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(args.decide_mode.as_deref(), Some("local"));
         assert_eq!(
             args.decide_model_dir.as_deref(),
             Some("/models/xerj-decide")
         );
+    }
+
+    #[test]
+    fn a_value_flag_without_its_value_is_an_error_not_unset() {
+        // #1435: given last, or followed by another flag, the value is
+        // missing — this used to boot on the default silently.
+        for line in [
+            &["--insecure", "--data-dir"][..],
+            &["--port"][..],
+            &["-c"][..],
+            &["--data-dir", "--insecure"][..],
+            &["--bind", "--port", "9300"][..],
+            &["--decide-model-dir"][..],
+            &["--data-dir", "-k"][..],
+            &["-d", "-c", "xerj.toml"][..],
+        ] {
+            let err = parse_args_from(argv(line)).err();
+            assert!(
+                err.as_deref().is_some_and(|e| e.contains("needs a value")),
+                "{line:?} must be refused, got {err:?}"
+            );
+        }
+        // A value that merely contains or starts with a single dash is fine.
+        let args = parse_args_from(argv(&["-d", "-data", "--bind", "::1"])).unwrap();
+        assert_eq!(args.data_dir.as_deref(), Some("-data"));
+        assert_eq!(args.bind.as_deref(), Some("::1"));
+        let args = parse_args_from(argv(&["--port", "-1"])).unwrap();
+        assert_eq!(args.port.as_deref(), Some("-1"), "left to the port check");
+    }
+
+    #[test]
+    fn index_counts_refuse_a_non_number_instead_of_defaulting() {
+        use super::parse_count;
+        assert_eq!(parse_count("--batch", Some("200".into())), Ok(200));
+        assert!(parse_count("--batch", Some("abc".into()))
+            .unwrap_err()
+            .contains("whole number"));
+        assert!(parse_count("--workers", Some("-1".into())).is_err());
+        assert!(parse_count("--limit", None)
+            .unwrap_err()
+            .contains("needs a value"));
     }
 
     #[test]
@@ -2039,7 +2122,7 @@ mod decide_flag_tests {
 
     #[test]
     fn decide_flags_default_to_none() {
-        let args = parse_args_from(argv(&[]));
+        let args = parse_args_from(argv(&[])).unwrap();
         assert_eq!(args.decide_mode, None);
         assert_eq!(args.decide_model_dir, None);
     }
@@ -2060,7 +2143,8 @@ mod decide_flag_tests {
             "opensearch",
             "-d",
             "./data",
-        ]));
+        ]))
+        .unwrap();
         assert!(args.insecure);
         assert_eq!(args.embed_mode.as_deref(), Some("neural"));
         assert_eq!(args.compat_distribution.as_deref(), Some("opensearch"));
