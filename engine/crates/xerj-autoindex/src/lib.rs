@@ -5806,7 +5806,7 @@ fn run_index_report_inner(
     // — `xerj-server`'s brain endpoint does exactly that — the installed width
     // can differ from what this run's plan asked for. Progress must state the
     // number the policy got, not the one it requested (#240 + #241).
-    let scan_threads = pool::scan_pool().current_num_threads();
+    let scan_threads = pool::width();
     extract::pdf::configure_workers(cfg.pdf_workers);
     extract::pdf::configure_timeout(cfg.pdf_timeout_secs);
     // A mailbox is one file on one Phase-B worker; inside it, messages are

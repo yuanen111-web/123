@@ -3212,7 +3212,7 @@ fn the_resource_plan_is_announced_on_the_progress_surface_with_the_width_it_got(
 
     // Build the process-global scan pool first, so the width below is one this
     // run cannot possibly be granted.
-    let installed = crate::pool::scan_pool().current_num_threads();
+    let installed = crate::pool::width();
     let endpoint = MockEndpoint::start(usize::MAX);
     let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
     config.quiet = false;
