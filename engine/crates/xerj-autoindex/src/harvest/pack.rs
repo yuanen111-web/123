@@ -132,6 +132,21 @@ pub fn emit(
         shard_lines[bucket].push('\n');
     }
 
+    // Remove any `records-*.jsonl` left in `pack_dir` by an earlier generation
+    // that populated different (or more) shard buckets: otherwise orphan shard
+    // files survive on disk and ship in a zip while invisible to `manifest.json`
+    // and `SHA256SUMS` (#1110 gap 5a).
+    for entry in std::fs::read_dir(&pack_dir)
+        .with_context(|| format!("cannot read pack dir {}", pack_dir.display()))?
+    {
+        let e = entry.with_context(|| format!("cannot read entry in {}", pack_dir.display()))?;
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with("records-") && name.ends_with(".jsonl") {
+            std::fs::remove_file(e.path())
+                .with_context(|| format!("cannot remove stale shard {}", e.path().display()))?;
+        }
+    }
+
     let mut files: BTreeMap<String, Value> = BTreeMap::new();
     for (i, lines) in shard_lines.iter().enumerate() {
         let name = format!("records-{:05}.jsonl", i);
@@ -236,11 +251,27 @@ fn uniform_keys(records: &[Map<String, Value>]) -> BTreeMap<String, bool> {
 }
 
 fn previous_generation(pack_dir: &Path) -> Result<u64> {
-    let Ok(bytes) = std::fs::read(pack_dir.join("manifest.json")) else {
-        return Ok(0);
+    let manifest_path = pack_dir.join("manifest.json");
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(e).with_context(|| format!("cannot read {}", manifest_path.display()))
+        }
     };
-    let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    Ok(v.get("generation").and_then(Value::as_u64).unwrap_or(0))
+    let v: Value = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "corrupt previous manifest {} (not valid JSON; pass --fresh to rebuild from scratch)",
+            manifest_path.display()
+        )
+    })?;
+    v.get("generation").and_then(Value::as_u64).ok_or_else(|| {
+        anyhow::anyhow!(
+            "corrupt previous manifest {}: missing or non-integer 'generation' \
+             (pass --fresh to rebuild from scratch)",
+            manifest_path.display()
+        )
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -913,5 +944,94 @@ mod tests {
                 "empty shard files are never written"
             );
         }
+    }
+
+    #[test]
+    fn rebuild_with_fewer_shards_removes_orphan_records_files() {
+        // #1110 gap 5a: when a rebuild populates fewer (or different) shard
+        // buckets than the previous generation, stale `records-*.jsonl` files
+        // must be swept before writing new shards so they never survive on
+        // disk outside `manifest.json` and `SHA256SUMS`.
+        let tmp = tempfile::tempdir().unwrap();
+        let many: Vec<Map<String, Value>> = (0..32).map(|i| rec(&format!("id-{i}"), &[])).collect();
+        let r1 = emit(
+            tmp.path(),
+            &recipe("t", 16),
+            "# r\n",
+            many.clone(),
+            &stats_with_source(),
+            &sugg(&many),
+        )
+        .unwrap();
+        let gen1_shards: Vec<String> = std::fs::read_dir(&r1.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("records-") && n.ends_with(".jsonl"))
+            .collect();
+        assert!(gen1_shards.len() > 1, "multiple shard files populated");
+
+        let one = vec![rec("id-0", &[])];
+        let r2 = emit(
+            tmp.path(),
+            &recipe("t", 1),
+            "# r\n",
+            one.clone(),
+            &stats_with_source(),
+            &sugg(&one),
+        )
+        .unwrap();
+        assert_eq!(r2.generation, 2);
+        let gen2_shards: Vec<String> = std::fs::read_dir(&r2.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("records-") && n.ends_with(".jsonl"))
+            .collect();
+        assert_eq!(gen2_shards, vec!["records-00000.jsonl".to_string()]);
+    }
+
+    #[test]
+    fn emit_refuses_corrupt_previous_manifest_instead_of_resetting_generation() {
+        // #1110 gap 5b: a truncated or generation-less existing `manifest.json`
+        // must fail the rebuild loudly, not silently reset `generation` to 1.
+        let tmp = tempfile::tempdir().unwrap();
+        let one = vec![rec("a", &[])];
+        let r1 = emit(
+            tmp.path(),
+            &recipe("t", 1),
+            "# r\n",
+            one.clone(),
+            &stats_with_source(),
+            &sugg(&one),
+        )
+        .unwrap();
+        assert_eq!(r1.generation, 1);
+
+        std::fs::write(r1.dir.join("manifest.json"), "{truncated").unwrap();
+        let err = emit(
+            tmp.path(),
+            &recipe("t", 1),
+            "# r\n",
+            one.clone(),
+            &stats_with_source(),
+            &sugg(&one),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("corrupt previous manifest"), "{err}");
+
+        std::fs::write(r1.dir.join("manifest.json"), r#"{"format_version":1}"#).unwrap();
+        let err = emit(
+            tmp.path(),
+            &recipe("t", 1),
+            "# r\n",
+            one.clone(),
+            &stats_with_source(),
+            &sugg(&one),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing or non-integer 'generation'"), "{err}");
     }
 }
