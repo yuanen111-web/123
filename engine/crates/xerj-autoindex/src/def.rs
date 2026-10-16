@@ -12,7 +12,7 @@
 //! whole-file dump).
 
 use crate::esclient::Es;
-use crate::search::{is_identifier, passage_text};
+use crate::search::{hit_location, is_identifier, passage_text};
 use serde_json::{json, Value};
 
 const USAGE: &str = "\
@@ -80,7 +80,7 @@ fn def_query(query: &str, kind: Option<&str>, lang: Option<&str>, k: usize) -> V
             "filter": filter,
             "minimum_should_match": 1
         } },
-        "_source": ["ax_path", "path", "line", "kind", "language", "name", "code"],
+        "_source": ["ax_path", "path", "line", "start_line", "kind", "language", "name", "code"],
         "fields": ["_passage"]
     })
 }
@@ -187,16 +187,7 @@ pub fn run_def_cli() -> i32 {
 
     for h in &hits {
         let src = h.get("_source").cloned().unwrap_or(Value::Null);
-        let path = src
-            .get("ax_path")
-            .or_else(|| src.get("path"))
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let line = src.get("line").and_then(Value::as_u64);
-        let loc = match line {
-            Some(n) => format!("{path}:{n}"),
-            None => path.to_string(),
-        };
+        let loc = hit_location(h);
         let kind = src.get("kind").and_then(Value::as_str).unwrap_or("");
         let tag = if kind.is_empty() {
             String::new()

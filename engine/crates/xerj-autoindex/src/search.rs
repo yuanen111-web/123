@@ -93,6 +93,44 @@ pub fn search_query_body(query: &str, k: usize) -> Value {
     })
 }
 
+/// Extract the 1-based starting line number from `fields._passage[0].ordinal`
+/// when `_passage` comes from a document body field (ignoring synthetic
+/// single-line or symbol-list metadata fields such as `defs` or `title`).
+///
+/// Only valid for LEXICAL passages, where the engine defines `ordinal` as
+/// the zero-based line index (`PassageMatch` in xerj-query). On a semantic
+/// hit it is a chunk ordinal instead; `xerj search` and `xerj def` send
+/// lexical queries only, so every passage they render is lexical.
+pub(crate) fn passage_line(hit: &Value) -> Option<u64> {
+    let first = hit.pointer("/fields/_passage/0")?.as_object()?;
+    if matches!(
+        first.get("field").and_then(Value::as_str),
+        Some("defs" | "title" | "name")
+    ) {
+        return None;
+    }
+    first.get("ordinal").and_then(Value::as_u64).map(|o| o + 1)
+}
+
+/// Format the `path[:line]` header token for a search or definition hit.
+pub(crate) fn hit_location(hit: &Value) -> String {
+    let src = hit.get("_source").unwrap_or(&Value::Null);
+    let path = src
+        .get("ax_path")
+        .or_else(|| src.get("path"))
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let line = src
+        .get("line")
+        .or_else(|| src.get("start_line"))
+        .and_then(Value::as_u64)
+        .or_else(|| passage_line(hit));
+    match line {
+        Some(n) => format!("{path}:{n}"),
+        None => path.to_string(),
+    }
+}
+
 /// Entry point for the `search` subcommand. Returns a process exit code.
 pub fn run_search_cli() -> i32 {
     let mut url = std::env::var("XERJ_URL")
@@ -208,16 +246,8 @@ pub fn run_search_cli() -> i32 {
 
     for h in &hits {
         let src = h.get("_source").cloned().unwrap_or(Value::Null);
-        let path = src.get("ax_path").and_then(Value::as_str).unwrap_or("?");
         let score = h.get("_score").and_then(Value::as_f64).unwrap_or(0.0);
-        let line = src
-            .get("line")
-            .or_else(|| src.get("start_line"))
-            .and_then(Value::as_u64);
-        let loc = match line {
-            Some(n) => format!("{path}:{n}"),
-            None => path.to_string(),
-        };
+        let loc = hit_location(h);
         let kind = src.get("kind").and_then(Value::as_str).unwrap_or("");
         let tag = if kind.is_empty() {
             String::new()
@@ -338,5 +368,66 @@ mod tests {
             }
         });
         assert_eq!(passage_text(&hit), None);
+    }
+
+    /// #1365: whole-file hits (`ax-code-*`, `ax-docs-md-*`, `ax-text-*`) carry
+    /// no `_source.line` or `_source.start_line`, so `hit_location` must
+    /// convert `fields._passage[0].ordinal` (0-based line index of the snippet)
+    /// to a 1-based `:line` suffix when `_passage` comes from the file body
+    /// (and ignore synthetic metadata fields like `defs` or `title`).
+    #[test]
+    fn whole_file_hit_uses_one_based_passage_ordinal_when_source_has_no_line() {
+        let whole_file_hit = json!({
+            "_source": {
+                "ax_path": "crates/fjall/src/batch.rs",
+                "language": "rust"
+            },
+            "fields": {
+                "_passage": [{
+                    "field": "body",
+                    "ordinal": 41,
+                    "start_offset": 1200,
+                    "end_offset": 1450,
+                    "text": "pub fn commit(&mut self) -> crate::Result<()> {\n    Ok(())\n}"
+                }]
+            }
+        });
+        assert_eq!(
+            hit_location(&whole_file_hit),
+            "crates/fjall/src/batch.rs:42"
+        );
+
+        let symbol_hit = json!({
+            "_source": {
+                "ax_path": "crates/fjall/src/batch.rs",
+                "line": 108,
+                "kind": "function"
+            },
+            "fields": {
+                "_passage": [{
+                    "field": "code",
+                    "ordinal": 0,
+                    "text": "pub fn commit(&mut self) -> crate::Result<()>"
+                }]
+            }
+        });
+        assert_eq!(hit_location(&symbol_hit), "crates/fjall/src/batch.rs:108");
+
+        let synthetic_defs_hit = json!({
+            "_source": {
+                "ax_path": "crates/fjall/src/batch.rs"
+            },
+            "fields": {
+                "_passage": [{
+                    "field": "defs",
+                    "ordinal": 0,
+                    "text": "fn commit"
+                }]
+            }
+        });
+        assert_eq!(
+            hit_location(&synthetic_defs_hit),
+            "crates/fjall/src/batch.rs"
+        );
     }
 }
