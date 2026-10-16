@@ -30,6 +30,9 @@
 //!   same-machine CLI/MCP commands (`xerj mcp`, `xerj autoindex`, `xerj init`)
 //! - [`xccode`]  — the reference-coding semantics shared by `xerj code`,
 //!   `xerj corpus`, and the `xerj_code_search` MCP tool (issue #977)
+//! - [`thread_spawn`] — spawning helper threads without aborting the node
+//!   on a failed spawn (#1122): the closure comes back, plus a process-wide
+//!   memory spawn gate
 //! - [`hub`]     — Corpus Hub v2 shared types: the catalogue, pack manifest,
 //!   definition record, and the [`hub::Answer`] every surface renders (#1374)
 
@@ -46,6 +49,7 @@ pub mod metrics;
 pub mod net;
 pub mod resource;
 pub mod schema;
+pub mod thread_spawn;
 pub mod types;
 pub mod xccode;
 

@@ -754,7 +754,12 @@ fn resolve_segment_hydration_budget(
 /// call wins (subsequent calls return the already-installed governor, so a
 /// second `Engine` in-process — e.g. a test — does not re-key the budgets).
 pub fn init(config: &Config) -> Arc<ResourceGovernor> {
-    Arc::clone(GOVERNOR.get_or_init(|| Arc::new(build(config))))
+    let governor = Arc::clone(GOVERNOR.get_or_init(|| Arc::new(build(config))));
+    // #1122: every crate that spawns through `xerj_common::thread_spawn`
+    // (storage, server, …) consults this same watermark check, so a spawn
+    // under memory exhaustion is refused instead of aborting the node.
+    xerj_common::thread_spawn::install_spawn_gate(thread_spawn_safe);
+    governor
 }
 
 /// The installed governor, if [`init`] has run. Engine-only unit tests that
