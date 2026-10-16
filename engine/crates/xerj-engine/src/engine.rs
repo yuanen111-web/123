@@ -3908,7 +3908,7 @@ impl Engine {
     /// released.
     pub async fn release_rebuildable_memory(&self, indices: &[Arc<Index>]) -> usize {
         for idx in indices {
-            if idx.flush().await.is_err() {
+            if idx.memtable_bytes() > 0 && idx.flush().await.is_err() {
                 tracing::warn!("memory release: flush failed, releasing caches anyway");
             }
             idx.release_memory();

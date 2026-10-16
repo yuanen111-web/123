@@ -83,6 +83,13 @@ pub struct ResourceGovernor {
     rss_bytes: AtomicU64,
     /// Latched: last sample crossed the RSS watermark.
     memory_tripped: AtomicBool,
+    /// The effective watermark in force when the breaker last engaged (#1250).
+    /// The release hysteresis is only meaningful against the watermark that
+    /// tripped; when an operator re-tunes the watermark live
+    /// (`indices.breaker.total.limit`, #1323) the latch is re-evaluated
+    /// against the new value without the band, so a live raise releases at
+    /// once instead of waiting for RSS to fall 5% below the NEW watermark.
+    memory_trip_watermark: AtomicU64,
 
     // ── item 1: per-query memory guard (`max_query_memory_mb`) ──────────
     /// Maximum bytes a single query may be estimated to allocate. `0` = off.
@@ -147,8 +154,16 @@ impl ResourceGovernor {
         if self.memory_tripped.load(Ordering::Relaxed) {
             let rss = self.rss_bytes.load(Ordering::Relaxed);
             let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
+            // Inside the release band (#1250) RSS is already under the
+            // watermark while the drain finishes; say so rather than print a
+            // false `>=`.
+            let relation = if rss >= watermark {
+                ">="
+            } else {
+                "draining below"
+            };
             return Err(XerjError::circuit_breaking(format!(
-                "[parent] real memory circuit breaker tripped: rss={}MB >= watermark={}MB \
+                "[parent] real memory circuit breaker tripped: rss={}MB {relation} watermark={}MB \
                  ({}% of limit={}MB); writes rejected to prevent an out-of-memory kill \
                  (raise it live with PUT _cluster/settings {{\"persistent\":\
                  {{\"indices.breaker.total.limit\":\"<N>gb\"}}}})",
@@ -362,10 +377,36 @@ impl ResourceGovernor {
     /// `0` when it isn't available (e.g. from the [`Self::refresh`] test
     /// wrapper); it only affects that one log line, never admission.
     pub fn refresh_memory_disk(&self, rss: u64, disk_used_pct: u64, disk_avail_bytes: u64) {
-        // ── RSS watermark ──
-        self.rss_bytes.store(rss, Ordering::Relaxed);
+        // ── RSS watermark, with a bounded release hysteresis (#1250) ──
+        //
+        // Engage at `rss >= watermark`. Once engaged, hold the latch while RSS
+        // sits in the band `[95% of watermark, watermark)` only for as long as
+        // RSS is still FALLING — the memory-pressure drain is making progress,
+        // and releasing now would re-admit the write burst that re-trips the
+        // breaker a sample later (the rss=15,596MB vs watermark=15,564MB
+        // chatter in #1250). If RSS stops falling inside the band the drain
+        // has nothing more to free: holding would only reject writes the node
+        // can take and keep the sampler re-draining every
+        // `MEMORY_DRAIN_MIN_INTERVAL` forever, so the latch releases exactly
+        // as it did before the band existed. A live watermark change (#1323)
+        // drops the band for that sample: the operator's new value decides.
+        let prev_rss = self.rss_bytes.swap(rss, Ordering::Relaxed);
         let watermark = self.memory_watermark_bytes.load(Ordering::Relaxed);
-        let mem_next = watermark != 0 && rss >= watermark;
+        let cur_mem = self.memory_tripped.load(Ordering::Relaxed);
+        let retuned = self.memory_trip_watermark.load(Ordering::Relaxed) != watermark;
+        let release_bytes = watermark - (watermark / 20);
+        let mem_next = watermark != 0
+            && if rss >= watermark {
+                true
+            } else if cur_mem && !retuned {
+                rss >= release_bytes && rss < prev_rss
+            } else {
+                false
+            };
+        if mem_next {
+            self.memory_trip_watermark
+                .store(watermark, Ordering::Relaxed);
+        }
         if mem_next != self.memory_tripped.swap(mem_next, Ordering::Relaxed) {
             if mem_next {
                 tracing::warn!(
@@ -917,6 +958,7 @@ fn build(config: &Config) -> ResourceGovernor {
         memory_watermark_bytes: AtomicU64::new(memory_watermark_bytes),
         rss_bytes: AtomicU64::new(0),
         memory_tripped: AtomicBool::new(false),
+        memory_trip_watermark: AtomicU64::new(0),
         max_query_memory_bytes,
         search_pool: Arc::new(Semaphore::new(max_concurrent_searches)),
         max_concurrent_searches,
@@ -2024,5 +2066,101 @@ mod tests {
             .unwrap();
         assert_eq!(g.search_inflight_peak(), 2, "concurrency never exceeded 2");
         drop(p2);
+    }
+
+    #[test]
+    fn memory_watermark_releases_with_hysteresis() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        assert!(wm > 0, "this test needs a live RSS watermark");
+
+        g.refresh(0, wm, 0);
+        assert!(g.check_ingest_admission().is_err(), "trips at watermark");
+
+        // 98% of watermark is above the 95% release threshold and RSS is
+        // still falling (the drain is working): stays tripped.
+        g.refresh(0, wm * 98 / 100, 0);
+        let err = g.check_ingest_admission().unwrap_err().to_string();
+        assert!(
+            err.contains("draining below watermark"),
+            "an in-band rejection must not claim rss >= watermark: {err}"
+        );
+        g.refresh(0, wm * 97 / 100, 0);
+        assert!(
+            g.check_ingest_admission().is_err(),
+            "must remain tripped while RSS drains through the band"
+        );
+
+        // 94% of watermark is below the 95% release threshold: releases.
+        g.refresh(0, wm * 94 / 100, 0);
+        assert!(
+            g.check_ingest_admission().is_ok(),
+            "must release once RSS drops below 95% of watermark"
+        );
+    }
+
+    /// #1250 review: a node whose irreducible resident set settles INSIDE the
+    /// band after a drain must not stay write-blocked (and re-draining every
+    /// `MEMORY_DRAIN_MIN_INTERVAL`) forever. Once RSS stops falling the band
+    /// has nothing left to wait for and the latch releases, which is exactly
+    /// the pre-band behaviour.
+    #[test]
+    fn memory_hysteresis_releases_when_rss_stalls_inside_the_band() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        assert!(wm > 0, "this test needs a live RSS watermark");
+
+        g.refresh(0, wm + 1, 0);
+        assert!(g.memory_breaker_engaged());
+        g.refresh(0, wm * 97 / 100, 0);
+        assert!(g.memory_breaker_engaged(), "still draining");
+        // The drain freed nothing more: RSS is flat inside the band.
+        g.refresh(0, wm * 97 / 100, 0);
+        assert!(
+            !g.memory_breaker_engaged(),
+            "a stalled in-band RSS must release, not latch forever"
+        );
+        assert!(g.check_ingest_admission().is_ok());
+    }
+
+    /// #1250 x #1323: the watermark is live-tunable. Raising it while the
+    /// breaker is engaged must release at once whenever RSS is under the NEW
+    /// watermark — not wait for RSS to fall 5% below it — or the live fix
+    /// #1323 shipped would be undone by the band.
+    #[test]
+    fn live_watermark_raise_releases_without_the_hysteresis_band() {
+        let mut cfg = Config::default();
+        cfg.limits.max_total_memtable_mb = 0;
+        cfg.limits.memory_watermark_percent = 95;
+        cfg.limits.max_process_memory_mb = 1024;
+        let g = build(&cfg);
+        let wm = g.memory_watermark_bytes.load(Ordering::Relaxed);
+        assert!(wm > 0, "this test needs a live RSS watermark");
+        let rss = wm + 1;
+        g.refresh(0, rss, 0);
+        assert!(g.check_ingest_admission().is_err());
+
+        // Raise just above the current RSS: RSS is now inside the new
+        // watermark's 5% band, and still (barely) falling.
+        let raised = (rss + rss / 50).min(g.machine_memory_bytes);
+        assert!(raised > rss, "test box must have headroom over 1 GiB");
+        g.set_memory_watermark_override(Some(raised));
+        g.refresh(0, rss - 1, 0);
+        assert!(
+            g.check_ingest_admission().is_ok(),
+            "a live raise above RSS must stop the 429s on the next sample"
+        );
+
+        // The band still applies to a trip against the raised watermark.
+        g.refresh(0, raised, 0);
+        assert!(g.check_ingest_admission().is_err());
+        g.refresh(0, raised * 98 / 100, 0);
+        assert!(g.check_ingest_admission().is_err());
     }
 }

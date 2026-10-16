@@ -150,7 +150,15 @@ pub struct BulkAdmission {
 /// One congestion event may be reported by every worker that was in flight
 /// when the server pushed back; they must count once.
 const SHRINK_COOLDOWN: Duration = Duration::from_secs(1);
-/// Clean bulks required before the limit is probed upward by one.
+/// While no bulk has succeeded since the last shrink, coalesce repeated 429
+/// retries from the same parent-breaker trip into a single halving for up to
+/// 15 s (issue #1250) instead of cascading 32 → 16 → 8 → 4 → 2 → 1 once per
+/// second while the server drains. Sized from the issue's data: the server's
+/// breaker/drain cycle repeated every ~12 s, so a window shorter than that
+/// (1 s before, or 2 s) still lets one trip halve the window five times.
+const EPISODE_MAX_COOLDOWN: Duration = Duration::from_secs(15);
+/// Clean bulks required before the limit is probed upward by one below
+/// `ssthresh` (above `ssthresh`, congestion avoidance scales this by `limit`).
 const RECOVER_AFTER: usize = 8;
 
 /// Minimum gap between two "raising bulk concurrency" lines on stderr.
@@ -166,6 +174,16 @@ struct AdmissionState {
     in_flight: usize,
     ok_streak: usize,
     last_shrink: Option<Instant>,
+    /// True after a shrink until at least one bulk succeeds, so sustained 429
+    /// retries during a single breaker trip do not halve repeatedly every 1 s.
+    shrunk_in_episode: bool,
+    /// Slow-start threshold, set on each shrink to 3/4 of the limit that
+    /// tripped (kept above the halved limit). Below it, recovery steps every
+    /// `RECOVER_AFTER` clean bulks; at or above it — the band just under the
+    /// concurrency that last tripped the breaker — congestion avoidance needs
+    /// `RECOVER_AFTER * limit` clean bulks per +1 step, so the client creeps
+    /// up to the old ceiling instead of sprinting back into it.
+    ssthresh: usize,
     /// When the last "raising" line was printed, and the limit it named —
     /// so the next line can name the whole climb since.
     last_raise_announce: Option<Instant>,
@@ -205,6 +223,8 @@ impl BulkAdmission {
                 in_flight: 0,
                 ok_streak: 0,
                 last_shrink: None,
+                shrunk_in_episode: false,
+                ssthresh: ceiling,
                 last_raise_announce: None,
                 announced_limit: ceiling,
             }),
@@ -266,11 +286,20 @@ impl BulkAdmission {
         {
             return;
         }
+        if state.shrunk_in_episode
+            && state
+                .last_shrink
+                .is_some_and(|last| now.duration_since(last) < EPISODE_MAX_COOLDOWN)
+        {
+            return;
+        }
         state.last_shrink = Some(now);
         state.ok_streak = 0;
+        state.shrunk_in_episode = true;
         self.congestion_events.fetch_add(1, Ordering::Relaxed);
         let previous = state.limit;
         state.limit = (previous / 2).max(1);
+        state.ssthresh = (previous * 3 / 4).max(state.limit + 1);
         if state.limit != previous && self.announce {
             eprintln!(
                 "autoindex: server pushed back (HTTP 429); lowering bulk concurrency \
@@ -290,11 +319,17 @@ impl BulkAdmission {
             return;
         }
         let mut state = self.inner.lock().unwrap();
+        state.shrunk_in_episode = false;
         if state.limit >= self.ceiling {
             return;
         }
         state.ok_streak += 1;
-        if state.ok_streak < RECOVER_AFTER {
+        let needed = if state.limit < state.ssthresh {
+            RECOVER_AFTER
+        } else {
+            RECOVER_AFTER.saturating_mul(state.limit.max(1))
+        };
+        if state.ok_streak < needed {
             return;
         }
         state.ok_streak = 0;
@@ -1412,9 +1447,6 @@ impl Es {
     }
 
     fn bulk_bounded(&self, body: Vec<u8>, max_bytes: usize) -> Result<BulkOutcome> {
-        // One admission slot for the whole body: its windows go out one after
-        // another, so this worker never offers more than one request at once.
-        let _permit = self.admission.acquire();
         let mut pending = std::collections::VecDeque::from([body]);
         let mut total = BulkOutcome::default();
         while let Some(next) = pending.pop_front() {
@@ -1619,6 +1651,10 @@ impl Es {
         // breaker happened to answer with.
         let throttles = std::cell::Cell::new(0u64);
         let round = self.retry_loop("_bulk", || {
+            // Acquire the admission permit per HTTP attempt rather than across
+            // the whole backoff loop (#1250), so throttled workers drop their
+            // slot before sleeping and immediately obey a halved window limit.
+            let _permit = self.admission.acquire();
             let resp = match self.send_bulk(body.clone()) {
                 Ok(resp) => resp,
                 Err(e) => return Attempt::Failed(e),
@@ -3977,5 +4013,87 @@ mod mapping_refusal_tests {
             let rendered = mapping_error("/ax/_mapping".into(), status, "body".into()).to_string();
             assert_eq!(rendered, format!("PUT /ax/_mapping failed: {status} body"));
         }
+    }
+
+    #[test]
+    fn sustained_429_episode_halves_once_and_congestion_avoidance_slows_climb_near_ceiling() {
+        let admission = super::BulkAdmission::new(32, false);
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 16);
+        assert_eq!(admission.congestion_events(), 1);
+
+        // Simulate a 3 s parent-breaker trip where no bulk succeeds: backdate
+        // `last_shrink` past `SHRINK_COOLDOWN` (1 s) but within
+        // `EPISODE_MAX_COOLDOWN` (15 s). Repeated 429s must NOT cascade 16 → 8 → 4 → 2 → 1.
+        admission.inner.lock().unwrap().last_shrink =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3));
+        admission.on_congestion();
+        assert_eq!(
+            admission.limit(),
+            16,
+            "sustained 429s within one breaker episode must not cascade-halve past the first cut"
+        );
+        assert_eq!(admission.congestion_events(), 1);
+
+        // Below ssthresh (24), each +1 step takes RECOVER_AFTER (8) clean bulks.
+        for expected in 17..=24 {
+            for _ in 0..super::RECOVER_AFTER {
+                admission.on_success();
+            }
+            assert_eq!(admission.limit(), expected);
+        }
+
+        // At ssthresh (24), congestion avoidance kicks in: climbing 24 → 25
+        // requires RECOVER_AFTER * 24 clean bulks, not just 8.
+        for _ in 0..super::RECOVER_AFTER {
+            admission.on_success();
+        }
+        assert_eq!(
+            admission.limit(),
+            24,
+            "at or above ssthresh, 8 clean bulks must not immediately raise concurrency"
+        );
+        for _ in 0..(super::RECOVER_AFTER * 23) {
+            admission.on_success();
+        }
+        assert_eq!(admission.limit(), 25);
+    }
+
+    /// #1250 data: the parent breaker's drain cycle measured ~12 s on the
+    /// reporter's box (`memory breaker engaged ... every ~12 seconds`), and
+    /// the 1 s cooldown let one such cycle collapse the window 32 → 1. The
+    /// episode cooldown must therefore outlast one cycle (15 s), still let a
+    /// genuinely longer stall keep shrinking, and reset on the first clean
+    /// bulk so the NEXT trip is answered immediately.
+    #[test]
+    fn episode_cooldown_outlasts_one_breaker_cycle_and_resets_on_success() {
+        use std::time::{Duration, Instant};
+        let admission = super::BulkAdmission::new(32, false);
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 16);
+
+        // 12 s into the same trip, nothing has succeeded: still one halving.
+        admission.inner.lock().unwrap().last_shrink =
+            Some(Instant::now() - Duration::from_secs(12));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 16, "one ~12 s breaker cycle = one cut");
+        assert_eq!(super::EPISODE_MAX_COOLDOWN, Duration::from_secs(15));
+
+        // A stall that outlives the episode window keeps converging.
+        admission.inner.lock().unwrap().last_shrink =
+            Some(Instant::now() - Duration::from_secs(16));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 8);
+        assert_eq!(admission.congestion_events(), 2);
+        // ssthresh is 3/4 of the limit that tripped (16), above the new 8.
+        assert_eq!(admission.inner.lock().unwrap().ssthresh, 12);
+
+        // One clean bulk ends the episode; a new 429 past the 1 s
+        // de-duplication window is a NEW trip and halves at once.
+        admission.on_success();
+        admission.inner.lock().unwrap().last_shrink = Some(Instant::now() - Duration::from_secs(2));
+        admission.on_congestion();
+        assert_eq!(admission.limit(), 4);
+        assert_eq!(admission.congestion_events(), 3);
     }
 }
