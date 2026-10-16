@@ -1564,7 +1564,18 @@ pub fn run_ask_with(
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
-    let catalogue = if args.cached_catalogue_only {
+    // A build with no hub key can never verify a catalogue or a pack, so it
+    // never fetches one: only a catalogue already on this machine is used, and
+    // without one the answer is the plain no-key message (exit 5), not a parse
+    // error from whatever the hub URL happens to serve.
+    let catalogue = if !xerj_common::hub::hub_key_configured() {
+        match load_cached_catalogue(&hub_home) {
+            Ok(c) => c,
+            // The cached-catalogue error says "run `xerj hub sync`", which
+            // cannot help here; the no-key message is the whole answer.
+            Err(_) => return AskOutcome::fail(EXIT_NO_KEY, xerj_common::hub::NO_HUB_KEY_MESSAGE),
+        }
+    } else if args.cached_catalogue_only {
         match load_cached_catalogue(&hub_home) {
             Ok(c) => c,
             Err(msg) => return AskOutcome::fail(EXIT_NO_ANSWER, msg),
@@ -1717,7 +1728,15 @@ pub fn load_cached_catalogue(hub_home: &Path) -> Result<Catalogue, String> {
 /// Only the MCP `xerj_hub_find` tool calls this.
 pub fn run_find(question: &str, k: usize) -> Result<FindOutcome, String> {
     let hub_home = cli::hub_home();
-    let catalogue = load_cached_catalogue(&hub_home)?;
+    let catalogue = load_cached_catalogue(&hub_home).map_err(|e| {
+        if xerj_common::hub::hub_key_configured() {
+            e
+        } else {
+            // `xerj hub sync` cannot help in a build with no key: say that,
+            // not "run xerj hub sync".
+            xerj_common::hub::NO_HUB_KEY_MESSAGE.to_string()
+        }
+    })?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Ok(find(question, k, &cwd, &hub_home, &catalogue))
 }

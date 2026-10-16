@@ -1119,6 +1119,13 @@ pub fn run_sync_using(
     let hub_home = default_hub_root();
     let cat = match refresh_catalogue(&hub_url(), &hub_home) {
         Ok(c) => c,
+        Err(_) if !xerj_common::hub::hub_key_configured() => {
+            eprintln!(
+                "xerj hub sync: {} Nothing was changed.",
+                xerj_common::hub::NO_HUB_KEY_MESSAGE
+            );
+            return crate::ask::EXIT_NO_KEY;
+        }
         Err(e) => {
             eprintln!("xerj hub sync: cannot refresh the catalogue; nothing was changed: {e:#}");
             return EXIT_INFRA;

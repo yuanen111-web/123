@@ -41,6 +41,24 @@ pub const DISK_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// the `XERJ_HUB_PUBKEY` environment variable for tests only.
 pub const HUB_PUBKEY_HEX: &str = "";
 
+/// True when this build can verify hub catalogues and packs: a key is compiled
+/// in ([`HUB_PUBKEY_HEX`]) or supplied through `XERJ_HUB_PUBKEY` (tests). A
+/// build without one cannot use Corpus Hub packs at all, so the hub surfaces
+/// (`xerj ask`, `xerj hub sync|pull`, the MCP hub tools, `xerj init`'s hub
+/// skill) say so plainly instead of failing on whatever the network returns.
+pub fn hub_key_configured() -> bool {
+    !HUB_PUBKEY_HEX.is_empty()
+        || std::env::var("XERJ_HUB_PUBKEY")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
+}
+
+/// What every hub surface says in a build with no hub key.
+pub const NO_HUB_KEY_MESSAGE: &str = "Corpus Hub packs are not available in this build: it has \
+     no hub signing key, so no catalogue or pack can be verified and nothing was downloaded. \
+     For reference code, index the projects yourself with `xerj corpus add` and search them \
+     with `xerj code` (see `xerj code --help`).";
+
 /// What a per-source licence review allows, straight from the registry's
 /// `review.use`. Governs whether a pack is pulled silently, with a warning, or
 /// never.

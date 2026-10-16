@@ -229,11 +229,8 @@ fn help_text(feedback: bool) -> String {
                                                   of peer projects (see xerj code --help)\n\
              xerj corpus add|index|list          the corpus lifecycle behind `xerj code`\n\
                                                   (see xerj corpus --help)\n\
-             xerj ask \"<question>\"              answer a question from a hub corpus: the\n\
-                                                  pre-indexed pack is pulled the first time\n\
-                                                  (see xerj ask --help); `xerj \"<question>\"`\n\
-                                                  is the same\n\
-             xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
+         {ask_lines}\
+         xerj index [OPTIONS]                direct NDJSON → engine ingest (see xerj\n\
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
                                                   brain --help)\n\
@@ -405,7 +402,24 @@ fn help_text(feedback: bool) -> String {
         // Counted from the served `tools/list`, not typed: the literal "13"
         // went stale the day the three Corpus Hub tools landed (#1443).
         mcp_tools = mcp_tool_count(),
+        ask_lines = ask_help_lines(xerj_common::hub::hub_key_configured()),
     )
+}
+
+/// The `xerj ask` usage lines. A build with no hub signing key can verify no
+/// pack, so there the line says the command is unavailable instead of
+/// promising a pull that will only ever exit 5.
+fn ask_help_lines(hub: bool) -> &'static str {
+    if hub {
+        "xerj ask \"<question>\"              answer a question from a hub corpus: the\n\
+         pre-indexed pack is pulled the first time\n\
+         (see xerj ask --help); `xerj \"<question>\"`\n\
+         is the same\n"
+    } else {
+        "xerj ask \"<question>\"              Corpus Hub answers: not available in this\n\
+         build (no hub signing key; exits 5) - use\n\
+         xerj corpus + xerj code instead\n"
+    }
 }
 
 /// How many tools `xerj mcp` serves — the length of the same `tool_specs()`

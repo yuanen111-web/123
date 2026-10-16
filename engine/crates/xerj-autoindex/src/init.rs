@@ -229,15 +229,19 @@ fn mcp_registration(bin: &str, url: &str) -> String {
     )
 }
 
-/// What init says last: where to go next, the hub's one line, and the
-/// per-client MCP registration.
-fn closing_message(bin: &str, url: &str) -> String {
+/// What init says last: where to go next, the hub's one line (only in a build
+/// that can verify hub packs — `hub`), and the per-client MCP registration.
+fn closing_message(bin: &str, url: &str, hub: bool) -> String {
+    let hub_line = if hub {
+        "Public libraries, standards and advisories need no indexing: ask the hub with\n\
+         `xerj \"<question>\"` (the xerj-hub skill says when).\n\n"
+    } else {
+        ""
+    };
     format!(
         "\ndone. Restart the agent session to pick up the tools, then\n\
          `xerj autoindex <folder>` anything you want searchable.\n\n\
-         Public libraries, standards and advisories need no indexing: ask the hub with\n\
-         `xerj \"<question>\"` (the xerj-hub skill says when).\n\n\
-         {}",
+         {hub_line}{}",
         mcp_registration(bin, url)
     )
 }
@@ -448,7 +452,8 @@ pub fn run_init_cli() -> i32 {
         }
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match run_init_in(&cwd, &url, dry) {
+    let hub = xerj_common::hub::hub_key_configured();
+    match run_init_with(&cwd, &url, dry, hub) {
         Ok(lines) => {
             println!(
                 "xerj init{} — wiring XERJ into this project:\n",
@@ -457,7 +462,7 @@ pub fn run_init_cli() -> i32 {
             for l in &lines {
                 println!("{l}");
             }
-            println!("{}", closing_message(&self_bin(), &url));
+            println!("{}", closing_message(&self_bin(), &url, hub));
             0
         }
         Err(e) => {
@@ -467,8 +472,23 @@ pub fn run_init_cli() -> i32 {
     }
 }
 
-/// The writable core, separated from argv/cwd so tests drive it directly.
+/// [`run_init_with`] in a build that can use the hub (the hub teaching files
+/// are written). Tests drive this; the CLI passes the build's real answer.
+#[cfg(test)]
 pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String>, String> {
+    run_init_with(cwd, url, dry, true)
+}
+
+/// The writable core, separated from argv/cwd so tests drive it directly.
+/// `hub` is false in a build with no hub signing key: no pack can be verified
+/// there, so the hub teaching files (which teach `xerj "<question>"`) are not
+/// written — an agent taught that line would only ever get exit 5.
+pub(crate) fn run_init_with(
+    cwd: &Path,
+    url: &str,
+    dry: bool,
+    hub: bool,
+) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
 
     // 1) MCP registration (.mcp.json, Claude Code project scope; other hosts
@@ -501,11 +521,13 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
             &skill_md(),
             dry,
         )?);
-        out.push(write_teaching_file(
-            &cwd.join(".claude/skills/xerj-hub/SKILL.md"),
-            HUB_SKILL_MD,
-            dry,
-        )?);
+        if hub {
+            out.push(write_teaching_file(
+                &cwd.join(".claude/skills/xerj-hub/SKILL.md"),
+                HUB_SKILL_MD,
+                dry,
+            )?);
+        }
     }
 
     // 3) Cursor rules — only when the project already has a .cursor directory.
@@ -516,11 +538,13 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
             &skill_md(),
             dry,
         )?);
-        out.push(write_teaching_file(
-            &cwd.join(".cursor/rules/xerj-hub.mdc"),
-            HUB_SKILL_MD,
-            dry,
-        )?);
+        if hub {
+            out.push(write_teaching_file(
+                &cwd.join(".cursor/rules/xerj-hub.mdc"),
+                HUB_SKILL_MD,
+                dry,
+            )?);
+        }
     }
 
     // 4) AGENTS.md — the cross-agent convention. Append a short section if the
@@ -569,12 +593,11 @@ pub(crate) fn run_init_in(cwd: &Path, url: &str, dry: bool) -> Result<Vec<String
                 "  auth     MCP authenticates with the admin key at {} (local node)",
                 path.display()
             )),
-            None => out.push(
+            None => out.push(format!(
                 "  auth     no --auth given and no local admin key found; if the node at \
                  {url} runs with auth on, add \"XERJ_AUTH\": \"ApiKey <key>\" to the \
                  .mcp.json env — the key is the node's <data-dir>/admin.key"
-                    .to_string(),
-            ),
+            )),
         }
     } else {
         out.push(format!(
@@ -904,7 +927,7 @@ mod tests {
         let success = format!("`{MCP_SUCCESS_TOOL}` is in the tool list");
         assert!(HUB_SKILL_MD.contains(&success));
         assert!(printed.contains(&success), "{printed}");
-        let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL);
+        let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL, true);
         assert!(closing.contains(&printed));
         assert!(closing.contains(r#"xerj "<question>""#));
         assert!(closing.contains("xerj autoindex <folder>"));
@@ -1189,6 +1212,35 @@ mod tests {
             note.contains("XERJ_AUTH") && note.contains("admin.key"),
             "the fallback note must name the env var and the key file: {note}"
         );
+        assert!(
+            note.contains("http://localhost:9200") && !note.contains("{url}"),
+            "the note names the node it means, not a literal placeholder: {note}"
+        );
+    }
+
+    /// A build with no hub signing key can verify no pack, so `xerj ask` only
+    /// ever exits 5 there: init must not teach it. No hub skill, no hub rule,
+    /// no `xerj "<question>"` line; the local skill and MCP wiring are intact.
+    #[test]
+    fn a_build_without_a_hub_key_does_not_teach_the_hub() {
+        let d = tmp();
+        fs::create_dir_all(d.path().join(".claude")).unwrap();
+        fs::create_dir_all(d.path().join(".cursor")).unwrap();
+        let lines = run_init_with(d.path(), "http://x:1", false, false).unwrap();
+        assert!(d.path().join(".claude/skills/xerj/SKILL.md").exists());
+        assert!(d.path().join(".cursor/rules/xerj.mdc").exists());
+        assert!(d.path().join(".mcp.json").exists());
+        assert!(
+            !d.path().join(".claude/skills/xerj-hub").exists(),
+            "{lines:?}"
+        );
+        assert!(
+            !d.path().join(".cursor/rules/xerj-hub.mdc").exists(),
+            "{lines:?}"
+        );
+        let closing = closing_message("/usr/local/bin/xerj", DEFAULT_URL, false);
+        assert!(!closing.contains(r#"xerj "<question>""#), "{closing}");
+        assert!(closing.contains("xerj autoindex <folder>"), "{closing}");
     }
 
     /// A non-loopback URL never triggers discovery, even with a local key

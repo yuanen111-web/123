@@ -680,8 +680,16 @@ pub(crate) fn plan_pull(slug: &str) -> Result<PullPlan, PullError> {
         .unwrap_or_else(|| DEFAULT_HUB_URL.to_string());
 
     // 1. Catalogue → the entry for this slug.
-    let cat = load_catalogue(&hub_url, &hub_home, false)
-        .map_err(|e| PullError::new(E_INFRA, format!("cannot load catalogue: {e:#}")))?;
+    let cat = load_catalogue(&hub_url, &hub_home, false).map_err(|e| {
+        if xerj_common::hub::hub_key_configured() {
+            PullError::new(E_INFRA, format!("cannot load catalogue: {e:#}"))
+        } else {
+            // A build with no hub key could not verify the pack either; the
+            // catalogue error (often a parse error on whatever the hub URL
+            // serves) is not the useful answer.
+            PullError::new(E_NOKEY, xerj_common::hub::NO_HUB_KEY_MESSAGE)
+        }
+    })?;
     let entry = cat.corpora.iter().find(|c| c.slug == slug).ok_or_else(|| {
         PullError::new(
             E_SLUG,
