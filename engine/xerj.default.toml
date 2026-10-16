@@ -39,6 +39,12 @@ grpc_port = 8081
 # Point existing ES clients, Kibana, or Logstash here.
 es_compat_port = 9200
 
+# When true, automatically scan and bind the next available ports if the
+# requested ports are already in use by another running instance.
+# Default in TOML is false (fail closed on taken ports); enabled by default for
+# CLI runs when no config file is passed.
+auto_port = false
+
 # Directory where all index data, WAL files, and segments are stored.
 # Ensure this path has sufficient disk space and fast I/O.
 data_dir = "./data"

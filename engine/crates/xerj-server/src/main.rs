@@ -110,6 +110,7 @@ struct CliArgs {
     data_dir: Option<String>,
     bind: Option<String>,
     port: Option<String>,
+    auto_port: Option<bool>,
     insecure: bool,
     embed_mode: Option<String>,
     onnx_model: Option<String>,
@@ -137,6 +138,7 @@ where
     let mut data_dir = None;
     let mut bind = None;
     let mut port: Option<String> = None;
+    let mut auto_port = None;
     let mut insecure = false;
     let mut embed_mode = None;
     let mut onnx_model = None;
@@ -159,6 +161,12 @@ where
             }
             "--port" => {
                 port = args.next();
+            }
+            "--auto-port" => {
+                auto_port = Some(true);
+            }
+            "--no-auto-port" => {
+                auto_port = Some(false);
             }
             "--insecure" | "-k" => {
                 insecure = true;
@@ -196,6 +204,7 @@ where
         data_dir,
         bind,
         port,
+        auto_port,
         insecure,
         embed_mode,
         onnx_model,
@@ -316,6 +325,10 @@ fn help_text(feedback: bool) -> String {
                                       flag: xerj --insecure --port 9300 -d ./other-data\n\
                                       Without it the native REST API listens on 8080 and gRPC on\n\
                                       8081 ([server] rest_port / grpc_port in the TOML config).\n\
+             --auto-port            Automatically bind the next available ports and fallback\n\
+                                      data dir if in use by another instance (default for CLI\n\
+                                      runs without a config file). Env: XERJ_AUTO_PORT\n\
+             --no-auto-port         Fail immediately if a port is already in use.\n\
              --disable-feedback     Do not print the feedback invitation above. Honoured in any\n\
                                       position, including after --help. Env:\n\
                                       XERJ_DISABLE_FEEDBACK=true\n\
@@ -634,6 +647,26 @@ fn load_config(args: &CliArgs) -> Result<Config> {
         cfg.server.es_compat_port = base;
         cfg.server.rest_port = base + 1;
         cfg.server.grpc_port = base + 2;
+    }
+
+    // Multi-instance auto-port selection: when enabled, if default or requested
+    // listener ports are already in use, the server automatically scans and binds
+    // the next available free ports.
+    // By default, auto_port is enabled when no explicit config file is provided
+    // (the standard CLI quickstart / multi-instance agent workflow).
+    if let Some(ap) = args.auto_port {
+        cfg.server.auto_port = ap;
+    } else if let Ok(val) = std::env::var("XERJ_AUTO_PORT") {
+        cfg.server.auto_port = matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    } else if args.config.is_none() {
+        cfg.server.auto_port = true;
+    }
+
+    if cfg.server.auto_port {
+        cfg.server.data_dir = resolve_available_data_dir(&cfg.server.data_dir);
     }
 
     // The #228 opt-out, also settable from the environment so a container can
@@ -1161,6 +1194,101 @@ fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> 
         .set_nonblocking(true)
         .with_context(|| format!("{name}: set the listener on {addr} non-blocking"))?;
     Ok(listener)
+}
+
+/// If `data_dir` is currently locked by another active running process, find
+/// the first available sibling directory (`<dir>-2`, `<dir>-3`, ...) so
+/// multiple instances can run simultaneously without colliding.
+fn resolve_available_data_dir(requested: &str) -> String {
+    let p = Path::new(requested);
+    let lock_file = p.join("node.lock");
+    if !lock_file.exists() {
+        return requested.to_string();
+    }
+
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_file)
+    {
+        if file.try_lock().is_err() {
+            let mut i = 2;
+            loop {
+                let candidate = format!("{requested}-{i}");
+                let candidate_path = Path::new(&candidate);
+                let candidate_lock = candidate_path.join("node.lock");
+                if !candidate_lock.exists() {
+                    info!(
+                        "data dir '{requested}' is already locked by another running instance; using '{candidate}' for this instance"
+                    );
+                    return candidate;
+                }
+                if let Ok(f) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&candidate_lock)
+                {
+                    if f.try_lock().is_ok() {
+                        info!(
+                            "data dir '{requested}' is already locked by another running instance; using '{candidate}' for this instance"
+                        );
+                        return candidate;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    requested.to_string()
+}
+
+/// Bind one listener, attempting consecutive ports if `auto_port` is true and
+/// the starting port is already in use (`AddrInUse`).
+fn bind_listener_candidate(
+    ip: std::net::IpAddr,
+    port: u16,
+    name: &'static str,
+    auto_port: bool,
+    avoid_ports: &[u16],
+) -> Result<(std::net::TcpListener, u16)> {
+    if !auto_port {
+        let addr = SocketAddr::new(ip, port);
+        let listener = bind_listener(addr, name)?;
+        return Ok((listener, port));
+    }
+
+    let mut candidate = port;
+    let max_port = port.saturating_add(1000).min(65535);
+
+    while candidate <= max_port {
+        if avoid_ports.contains(&candidate) {
+            candidate += 1;
+            continue;
+        }
+
+        let addr = SocketAddr::new(ip, candidate);
+        match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                listener
+                    .set_nonblocking(true)
+                    .with_context(|| format!("{name}: set the listener on {addr} non-blocking"))?;
+                if candidate != port {
+                    info!(
+                        "{name}: port {port} in use, automatically assigned port {candidate} for multi-instance support"
+                    );
+                }
+                return Ok((listener, candidate));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                candidate += 1;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("{name}: bind {addr}: {e}"));
+            }
+        }
+    }
+
+    anyhow::bail!("{name}: could not find a free port between {port} and {max_port}");
 }
 
 async fn serve_on(
@@ -2685,19 +2813,42 @@ async fn async_main() -> Result<()> {
     //     context is kept as a backstop so that if a future edit reorders or
     //     drops 3a, this still names the setting rather than surfacing a bare
     //     `Option` unwrap.
-    let rest_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.rest_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let es_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.es_compat_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let grpc_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.grpc_port)
-        .with_context(|| bad_bind_address(&cfg))?;
+    let ip = cfg.bind_ip().with_context(|| bad_bind_address(&cfg))?;
 
-    let rest_listener = bind_listener(rest_addr, "native REST")?;
-    let es_listener = bind_listener(es_addr, "ES-compat")?;
-    let grpc_listener = bind_listener(grpc_addr, "gRPC")?;
+    let mut avoid: Vec<u16> = Vec::new();
+    if cfg.cluster.enabled {
+        avoid.push(cfg.cluster.port);
+    }
+
+    let (es_listener, bound_es_port) = bind_listener_candidate(
+        ip,
+        cfg.server.es_compat_port,
+        "ES-compat",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+    avoid.push(bound_es_port);
+
+    let (rest_listener, bound_rest_port) = bind_listener_candidate(
+        ip,
+        cfg.server.rest_port,
+        "native REST",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+    avoid.push(bound_rest_port);
+
+    let (grpc_listener, bound_grpc_port) = bind_listener_candidate(
+        ip,
+        cfg.server.grpc_port,
+        "gRPC",
+        cfg.server.auto_port,
+        &avoid,
+    )?;
+
+    cfg.server.es_compat_port = bound_es_port;
+    cfg.server.rest_port = bound_rest_port;
+    cfg.server.grpc_port = bound_grpc_port;
 
     let bound = BoundAddrs {
         rest: rest_listener

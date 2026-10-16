@@ -618,6 +618,10 @@ pub struct ServerConfig {
     /// right-most address that is *not* itself a listed proxy is used — the
     /// left end of the chain is written by the caller and cannot be trusted.
     pub trusted_proxies: Vec<String>,
+    /// When `true`, automatically pick the next available port if a listener port
+    /// is already in use by another instance.
+    #[serde(default)]
+    pub auto_port: bool,
 }
 
 impl Default for ServerConfig {
@@ -633,6 +637,7 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1".into(),
             allow_insecure_network_bind: false,
             trusted_proxies: Vec::new(),
+            auto_port: false,
         }
     }
 }
